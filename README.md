@@ -69,6 +69,12 @@ electrum server:
   --no-batching        disable request batching
 ```
 
+## Tests
+
+```
+python3 -m unittest discover
+```
+
 ## Credits
 
 This tool was created after reading [this twitter thread](https://twitter.com/aantonop/status/1259478489427775491) by [@aantonop](https://twitter.com/aantonop). Many thanks for the idea and the relentless contributions to the Bitcoin community!
