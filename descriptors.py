@@ -136,6 +136,7 @@ class DescriptorScriptIterator:
         self.max_account = account_gap if path.has_variable_account() else 0
         self.used_accounts = set()
         self.priority_pairs = OrderedDict()
+        self.yielded_pairs = set()
         self.total_scripts = (self.max_index + 1) * (self.max_account + 1)
 
     def _script_at(self, master_key: BIP32, index: int, account: int) -> Script:
@@ -178,7 +179,26 @@ class DescriptorScriptIterator:
 
     def next_script(self, master_key: BIP32) -> Optional[Script]:
         """
-        Fetch the next script for the current descriptor.
+        Fetch the next script for the current descriptor, without ever yielding the same pair twice.
+        """
+        # Scripts are handed out before their results come back, so a pair that the grid already
+        # yielded can be queued again as a priority pair. Skipping the repeats here keeps that from
+        # reaching the caller, whenever the results happen to arrive
+        while True:
+            script = self._next_script(master_key)
+            if script is None:
+                return None
+
+            pair = (script.index, script.account)
+            if pair in self.yielded_pairs:
+                continue
+
+            self.yielded_pairs.add(pair)
+            return script
+
+    def _next_script(self, master_key: BIP32) -> Optional[Script]:
+        """
+        Fetch the next candidate script for the current descriptor.
         """
         # if there's any priority pairs, explore the first one
         for account, indexes in list(self.priority_pairs.items()):
