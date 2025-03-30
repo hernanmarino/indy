@@ -179,6 +179,14 @@ class TestDescriptorScriptIterator(unittest.TestCase):
         self.assertIsNotNone(descriptor.next_script(_master_key()))
         self.assertIsNone(descriptor.next_script(_master_key()))
 
+    def test_a_used_script_on_a_path_without_an_index_yields_nothing_more(self) -> None:
+        # A path with no index level derives one script and one only, so finding it used must not
+        # queue indexes that all resolve back to the very same address
+        descriptor = DescriptorScriptIterator(Path("m/44'/0'/0'"), ScriptType.LEGACY, 20, 0)
+        descriptor.found_used_script(descriptor.next_script(_master_key()))
+
+        self.assertIsNone(descriptor.next_script(_master_key()))
+
     def test_finding_a_used_script_queues_the_next_gap_of_indexes(self) -> None:
         descriptor = DescriptorScriptIterator(Path(VARIABLE_ACCOUNT_PATH), ScriptType.SEGWIT, 20, 0)
         descriptor.found_used_script(descriptor.next_script(_master_key()))

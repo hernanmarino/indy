@@ -233,11 +233,12 @@ class DescriptorScriptIterator:
             self.priority_pairs[script.account] = deque()
 
         # extend the priority list of pairs to explore with enough indexes so that the next address gap is covered
-        missing_indexes = self.priority_pairs[script.account]
-        last_index = missing_indexes[-1] if missing_indexes else script.index
-        new_indexes = range(last_index + 1, script.index + self.address_gap + 1)
-        missing_indexes.extend(new_indexes)
-        self.total_scripts += len([i for i in new_indexes if i > self.max_index])
+        if self.path.has_variable_index():
+            missing_indexes = self.priority_pairs[script.account]
+            last_index = missing_indexes[-1] if missing_indexes else script.index
+            new_indexes = range(last_index + 1, script.index + self.address_gap + 1)
+            missing_indexes.extend(new_indexes)
+            self.total_scripts += len([i for i in new_indexes if i > self.max_index])
 
         # extend the priority list of pairs to explore with enough accounts so that the next account gap is covered
         while (self.path.has_variable_account()
