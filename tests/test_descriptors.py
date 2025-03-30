@@ -8,6 +8,7 @@ from mnemonic import Mnemonic
 import descriptors
 from descriptors import DescriptorScriptIterator, Path, Script, ScriptIterator
 import scripts
+from scanner import MAX_BATCH_SIZE
 from scripts import ScriptType
 
 # Master key from the BIP32 test vector 1
@@ -178,6 +179,14 @@ class TestDescriptorScriptIterator(unittest.TestCase):
         self.assertIsNotNone(descriptor.next_script(_master_key()))
         self.assertIsNone(descriptor.next_script(_master_key()))
 
+    def test_a_used_script_on_a_path_without_an_index_yields_nothing_more(self) -> None:
+        # A path with no index level derives one script and one only, so finding it used must not
+        # queue indexes that all resolve back to the very same address
+        descriptor = DescriptorScriptIterator(Path("m/44'/0'/0'"), ScriptType.LEGACY, 20, 0)
+        descriptor.found_used_script(descriptor.next_script(_master_key()))
+
+        self.assertIsNone(descriptor.next_script(_master_key()))
+
     def test_finding_a_used_script_queues_the_next_gap_of_indexes(self) -> None:
         descriptor = DescriptorScriptIterator(Path(VARIABLE_ACCOUNT_PATH), ScriptType.SEGWIT, 20, 0)
         descriptor.found_used_script(descriptor.next_script(_master_key()))
@@ -208,33 +217,47 @@ class TestScriptIterator(unittest.TestCase):
         expected = sum(len(types) for types in descriptors.descriptors.values())
         self.assertEqual(len(iterator.descriptors), expected)
 
+    def test_a_used_address_never_makes_the_same_pair_come_out_twice(self) -> None:
+        used = {("m/84'/0'/0'/0/0", 'SEGWIT'), ("m/84'/0'/0'/0/1", 'SEGWIT')}
+
+        for batch_size in [1, MAX_BATCH_SIZE]:
+            result = _scan(used, batch_size=batch_size, max_scripts=5_000)
+
+            self.assertTrue(result['terminated'], f'batch {batch_size}')
+            self.assertEqual(result['repeated_pairs'], 0, f'batch {batch_size}')
+            self.assertEqual(result['found'].count(("m/84'/0'/0'/0/1", 'SEGWIT')), 1, f'batch {batch_size}')
+
+    def test_every_used_address_is_reported_once_however_many_are_found(self) -> None:
+        used = {(f"m/84'/0'/0'/0/{index}", 'SEGWIT') for index in range(3)}
+
+        for batch_size in [1, MAX_BATCH_SIZE]:
+            result = _scan(used, batch_size=batch_size, max_scripts=5_000)
+
+            self.assertTrue(result['terminated'], f'batch {batch_size}')
+            self.assertEqual(sorted(result['found']), sorted(used), f'batch {batch_size}')
+
+    def test_the_walk_never_yields_more_than_the_declared_total(self) -> None:
+        # The declared total can overshoot once indexes are requeued, which is how the progress bar
+        # has always counted; what must hold is that the walk never runs past it
+        for batch_size in [1, 2, MAX_BATCH_SIZE]:
+            result = _scan({("m/84'/0'/0'/0/0", 'SEGWIT')}, batch_size=batch_size, max_scripts=5_000)
+
+            self.assertTrue(result['terminated'], f'batch {batch_size}')
+            self.assertLessEqual(result['yielded'], result['declared'], f'batch {batch_size}')
+
+    def test_a_used_address_on_a_path_without_an_account_terminates(self) -> None:
+        # A path with no account level derives the same script whatever the account is, so walking
+        # accounts on it would keep finding the same address over and over
+        for batch_size in [1, MAX_BATCH_SIZE]:
+            result = _scan({("m/0'/0/0", 'LEGACY')}, batch_size=batch_size, max_scripts=3_000)
+
+            self.assertTrue(result['terminated'], f'batch {batch_size}')
+            self.assertEqual(result['found'], [("m/0'/0/0", 'LEGACY')], f'batch {batch_size}')
+
     def test_a_scan_with_no_used_addresses_terminates(self) -> None:
         result = _scan(used=set(), batch_size=100, max_scripts=5_000)
         self.assertTrue(result['terminated'])
         self.assertEqual(result['yielded'], result['declared'])
-
-
-class TestKnownDefects(unittest.TestCase):
-    """
-    Current behaviour of two defects in the traversal, kept here so that fixing them shows up as a
-    deliberate change. The assertions below describe what the code does today, not what it should do.
-    """
-
-    def test_a_used_address_makes_the_same_pair_come_out_twice(self) -> None:
-        # TODO: a pair should never be yielded twice; expect no repeats once this is fixed
-        used = {("m/84'/0'/0'/0/0", 'SEGWIT'), ("m/84'/0'/0'/0/1", 'SEGWIT')}
-        result = _scan(used, batch_size=1, max_scripts=5_000)
-
-        self.assertTrue(result['terminated'])
-        self.assertEqual(result['repeated_pairs'], 21)
-        self.assertEqual(result['found'].count(("m/84'/0'/0'/0/1", 'SEGWIT')), 2)
-
-    def test_a_used_address_on_a_fixed_account_path_never_finishes(self) -> None:
-        # TODO: this scan should terminate; expect a finite walk once this is fixed
-        result = _scan({("m/0'/0/0", 'LEGACY')}, batch_size=100, max_scripts=3_000)
-
-        self.assertFalse(result['terminated'])
-        self.assertGreater(len(result['found']), 1)
 
 
 if __name__ == '__main__':

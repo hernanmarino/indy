@@ -136,6 +136,7 @@ class DescriptorScriptIterator:
         self.max_account = account_gap if path.has_variable_account() else 0
         self.used_accounts = set()
         self.priority_pairs = OrderedDict()
+        self.yielded_pairs = set()
         self.total_scripts = (self.max_index + 1) * (self.max_account + 1)
 
     def _script_at(self, master_key: BIP32, index: int, account: int) -> Script:
@@ -178,7 +179,26 @@ class DescriptorScriptIterator:
 
     def next_script(self, master_key: BIP32) -> Optional[Script]:
         """
-        Fetch the next script for the current descriptor.
+        Fetch the next script for the current descriptor, without ever yielding the same pair twice.
+        """
+        # Scripts are handed out before their results come back, so a pair that the grid already
+        # yielded can be queued again as a priority pair. Skipping the repeats here keeps that from
+        # reaching the caller, whenever the results happen to arrive
+        while True:
+            script = self._next_script(master_key)
+            if script is None:
+                return None
+
+            pair = (script.index, script.account)
+            if pair in self.yielded_pairs:
+                continue
+
+            self.yielded_pairs.add(pair)
+            return script
+
+    def _next_script(self, master_key: BIP32) -> Optional[Script]:
+        """
+        Fetch the next candidate script for the current descriptor.
         """
         # if there's any priority pairs, explore the first one
         for account, indexes in list(self.priority_pairs.items()):
@@ -213,14 +233,16 @@ class DescriptorScriptIterator:
             self.priority_pairs[script.account] = deque()
 
         # extend the priority list of pairs to explore with enough indexes so that the next address gap is covered
-        missing_indexes = self.priority_pairs[script.account]
-        last_index = missing_indexes[-1] if missing_indexes else script.index
-        new_indexes = range(last_index + 1, script.index + self.address_gap + 1)
-        missing_indexes.extend(new_indexes)
-        self.total_scripts += len([i for i in new_indexes if i > self.max_index])
+        if self.path.has_variable_index():
+            missing_indexes = self.priority_pairs[script.account]
+            last_index = missing_indexes[-1] if missing_indexes else script.index
+            new_indexes = range(last_index + 1, script.index + self.address_gap + 1)
+            missing_indexes.extend(new_indexes)
+            self.total_scripts += len([i for i in new_indexes if i > self.max_index])
 
         # extend the priority list of pairs to explore with enough accounts so that the next account gap is covered
-        while self.max_account <= script.account + self.account_gap:
+        while (self.path.has_variable_account()
+               and self.max_account <= script.account + self.account_gap):
             self.max_account += 1
             self.total_scripts += self.max_index + 1
             current_diagonal = self.index + self.account
