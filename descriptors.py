@@ -240,7 +240,8 @@ class DescriptorScriptIterator:
         self.total_scripts += len([i for i in new_indexes if i > self.max_index])
 
         # extend the priority list of pairs to explore with enough accounts so that the next account gap is covered
-        while self.max_account <= script.account + self.account_gap:
+        while (self.path.has_variable_account()
+               and self.max_account <= script.account + self.account_gap):
             self.max_account += 1
             self.total_scripts += self.max_index + 1
             current_diagonal = self.index + self.account

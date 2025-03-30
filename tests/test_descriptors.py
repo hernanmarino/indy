@@ -237,6 +237,15 @@ class TestScriptIterator(unittest.TestCase):
             self.assertTrue(result['terminated'], f'batch {batch_size}')
             self.assertLessEqual(result['yielded'], result['declared'], f'batch {batch_size}')
 
+    def test_a_used_address_on_a_path_without_an_account_terminates(self) -> None:
+        # A path with no account level derives the same script whatever the account is, so walking
+        # accounts on it would keep finding the same address over and over
+        for batch_size in [1, MAX_BATCH_SIZE]:
+            result = _scan({("m/0'/0/0", 'LEGACY')}, batch_size=batch_size, max_scripts=3_000)
+
+            self.assertTrue(result['terminated'], f'batch {batch_size}')
+            self.assertEqual(result['found'], [("m/0'/0/0", 'LEGACY')], f'batch {batch_size}')
+
     def test_a_scan_with_no_used_addresses_terminates(self) -> None:
         result = _scan(used=set(), batch_size=100, max_scripts=5_000)
         self.assertTrue(result['terminated'])
