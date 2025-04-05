@@ -2,8 +2,9 @@
 import argparse
 import asyncio
 import json
+import os
 import random
-from typing import Optional
+from typing import List, Optional
 
 import connectrum
 from bip32 import BIP32
@@ -60,13 +61,10 @@ def main():
         port = (args.protocol + str(args.port)) if args.port else args.protocol
         server = ServerInfo(args.host, hostname=args.host, ports=port)
     else:
-        with open('servers.json', 'r') as f:
-            servers = json.load(f)
-        server = random.choice(servers)
+        server = random.choice(read_servers())
         server = ServerInfo(server['host'], hostname=server['host'], ports=server['port'])
 
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(find_utxos(
+    asyncio.run(find_utxos(
         server,
         master_key,
         args.address_gap,
@@ -76,7 +74,16 @@ def main():
         args.broadcast,
         not args.no_batching
     ))
-    loop.close()
+
+
+def read_servers() -> List[dict]:
+    """
+    Read the bundled list of electrum servers, wherever the tool was started from.
+    """
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'servers.json')
+
+    with open(path, 'r') as f:
+        return json.load(f)
 
 
 def parse_key(key: str, passphrase: str) -> BIP32:
