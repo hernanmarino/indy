@@ -76,7 +76,7 @@ async def scan_master_key(
                 if (path, type) not in descriptors:
                     descriptors.add((path, type))
                     message = f'🕵   Found used addresses at path={path} address_type={type}'
-                    print(f'\r{message}'.ljust(progress_bar.ncols))  # print the message replacing the current line
+                    progress_bar.write(message)
 
                 script.set_as_used()
                 used_scripts.append(script)
@@ -97,7 +97,7 @@ async def scan_master_key(
                     utxos.append(utxo)
 
                     message = f'💰  Found unspent output at ({txid}, {output_index}) with {amount} sats'
-                    print(f'\r{message}'.ljust(progress_bar.ncols))  # print the message replacing the current line
+                    progress_bar.write(message)
 
             # Update the progress bar
             progress_bar.total = script_iter.total_scripts()
