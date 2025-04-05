@@ -64,8 +64,7 @@ def main():
         server = random.choice(read_servers())
         server = ServerInfo(server['host'], hostname=server['host'], ports=server['port'])
 
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(find_utxos(
+    asyncio.run(find_utxos(
         server,
         master_key,
         args.address_gap,
@@ -75,7 +74,6 @@ def main():
         args.broadcast,
         not args.no_batching
     ))
-    loop.close()
 
 
 def read_servers() -> List[dict]:

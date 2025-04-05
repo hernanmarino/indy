@@ -61,5 +61,42 @@ class TestServerList(unittest.TestCase):
             self.assertIn('port', server)
 
 
+class TestEventLoop(unittest.TestCase):
+    """
+    The event loop the scan runs on.
+    """
+
+    def setUp(self) -> None:
+        # asyncio.run leaves no loop configured behind it, so that is the state to restore
+        self.addCleanup(asyncio.set_event_loop, None)
+
+    def test_the_scan_starts_with_no_event_loop_configured(self) -> None:
+        # Nothing sets up a loop before main runs, which is what breaks on Python 3.14
+        started = []
+
+        async def find_utxos(*args: object) -> None:
+            started.append(args)
+
+        asyncio.set_event_loop(None)
+        argv = ['indy.py', BIP32_TEST_XPRIV, '--host', 'example.invalid']
+
+        with mock.patch.object(indy, 'find_utxos', find_utxos), mock.patch.object(sys, 'argv', argv):
+            with redirect_stdout(io.StringIO()):
+                indy.main()
+
+        self.assertEqual(len(started), 1)
+
+    def test_the_electrum_client_takes_the_loop_it_is_built_inside(self) -> None:
+        # The client reaches for the running loop in its constructor, so it has to be built from
+        # inside the coroutine rather than before the loop exists
+        async def build() -> Tuple[StratumClient, asyncio.AbstractEventLoop]:
+            return StratumClient(), asyncio.get_running_loop()
+
+        asyncio.set_event_loop(None)
+        client, running_loop = asyncio.run(build())
+
+        self.assertIs(client.loop, running_loop)
+
+
 if __name__ == '__main__':
     unittest.main()
