@@ -29,6 +29,16 @@ BIP84_VECTORS = [
      'bc1q8c6fshw2dlwun7ekn9qwf37cu2rn755upcp6el'),
 ]
 
+# The same mnemonic at the BIP44 path, as each script type spells it. The legacy address is the
+# one that mnemonic is published under; the other two were built from that key with base58 and
+# bech32 rather than with the code these tests exercise
+BIP44_FIRST_ADDRESS_PATH = "m/44'/0'/0'/0/0"
+BIP44_ADDRESSES = [
+    (ScriptType.LEGACY, '1LqBGSKuX5yYUonjxT5qGfpUsXKYYWeabA'),
+    (ScriptType.COMPAT, '3HkzTaFbEMWeJPLyNCNhPyGfZsVLDwdD3G'),
+    (ScriptType.SEGWIT, 'bc1qmxrw6qdh5g3ztfcwm0et5l8mvws4eva24kmp8m'),
+]
+
 # A descriptor whose path has a variable account, and one whose path does not
 VARIABLE_ACCOUNT_PATH = "m/84'/0'/a'/0/i"
 FIXED_ACCOUNT_PATH = "m/0'/0/i"
@@ -117,7 +127,7 @@ class TestPath(unittest.TestCase):
 
 class TestDerivedScripts(unittest.TestCase):
     """
-    Scripts derived along a path, checked against the BIP84 test vectors.
+    Scripts derived along a path, checked against addresses published elsewhere.
     """
 
     def setUp(self) -> None:
@@ -127,6 +137,14 @@ class TestDerivedScripts(unittest.TestCase):
         for path, pubkey, _ in BIP84_VECTORS:
             derived = self.master_key.get_pubkey_from_path(Path(path).to_list())
             self.assertEqual(derived.hex(), pubkey, f'wrong public key at {path}')
+
+    def test_the_bip44_path_derives_the_addresses_of_all_three_script_types(self) -> None:
+        derived = self.master_key.get_pubkey_from_path(Path(BIP44_FIRST_ADDRESS_PATH).to_list())
+
+        for script_type, address in BIP44_ADDRESSES:
+            built = script_type.build_output_script(derived)
+            self.assertEqual(built, scripts.build_output_script_from_address(address),
+                             f'wrong script for {script_type.name}')
 
     def test_the_derived_scripts_match_the_published_addresses(self) -> None:
         for path, _, address in BIP84_VECTORS:
@@ -204,9 +222,15 @@ class TestScriptIterator(unittest.TestCase):
     """
 
     def test_cycles_through_the_descriptors_instead_of_draining_one(self) -> None:
+        # A descriptor is a path and a script type, and a path can carry more than one of those
         iterator = ScriptIterator(_master_key(), 20, 0)
-        paths = [iterator.next_script().descriptor.path.path for _ in range(4)]
-        self.assertEqual(len(set(paths)), 4)
+        seen = []
+
+        for _ in range(4):
+            script = iterator.next_script()
+            seen.append((script.descriptor.path.path, script.type().name))
+
+        self.assertEqual(len(set(seen)), 4)
 
     def test_the_declared_total_is_the_sum_over_all_descriptors(self) -> None:
         iterator = ScriptIterator(_master_key(), 20, 0)
@@ -253,6 +277,42 @@ class TestScriptIterator(unittest.TestCase):
 
             self.assertTrue(result['terminated'], f'batch {batch_size}')
             self.assertEqual(result['found'], [("m/0'/0/0", 'LEGACY')], f'batch {batch_size}')
+
+    def test_the_bip44_path_is_scanned_with_every_script_type(self) -> None:
+        # CoolWallet S puts P2SH-SegWit on m/44', and Bisq and KoinKeep put SegWit there
+        for chain in [0, 1]:
+            for script_type in ['LEGACY', 'COMPAT', 'SEGWIT']:
+                with self.subTest(chain=chain, script_type=script_type):
+                    address = f"m/44'/0'/0'/{chain}/0"
+                    result = _scan({(address, script_type)}, batch_size=MAX_BATCH_SIZE, max_scripts=5_000)
+
+                    self.assertTrue(result['terminated'])
+                    self.assertEqual(result['found'], [(address, script_type)])
+
+    def test_those_script_types_reach_past_the_first_account(self) -> None:
+        # The entries this replaces named account 0, so they covered one wallet each and no more
+        for chain in [0, 1]:
+            for script_type in ['COMPAT', 'SEGWIT']:
+                with self.subTest(chain=chain, script_type=script_type):
+                    address = f"m/44'/0'/1'/{chain}/0"
+                    result = _scan({(address, script_type)}, batch_size=MAX_BATCH_SIZE,
+                                   max_scripts=20_000, account_gap=1)
+
+                    self.assertTrue(result['terminated'])
+                    self.assertEqual(result['found'], [(address, script_type)])
+
+    def test_no_address_is_derived_twice_under_the_same_script_type(self) -> None:
+        # Two descriptors that resolve alike would look the same address up twice over
+        iterator = ScriptIterator(_master_key(), 20, 0)
+        derived = []
+
+        while True:
+            script = iterator.next_script()
+            if script is None:
+                break
+            derived.append((script.full_path().path, script.type().name))
+
+        self.assertEqual(len(derived), len(set(derived)))
 
     def test_a_scan_with_no_used_addresses_terminates(self) -> None:
         result = _scan(used=set(), batch_size=100, max_scripts=5_000)

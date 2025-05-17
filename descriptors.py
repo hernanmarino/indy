@@ -12,8 +12,10 @@ from scripts import ScriptType
 # a: account index
 # i: address index
 descriptors = {
-    "m/44'/0'/a'/0/i": [ScriptType.LEGACY],  # BIP44, external
-    "m/44'/0'/a'/1/i": [ScriptType.LEGACY],  # BIP44, change
+    # Wallets that took up segwit without leaving the BIP44 path put every script type here:
+    # CoolWallet S the P2SH wrapped one, and Bisq, Copay and KoinKeep the native one
+    "m/44'/0'/a'/0/i": [ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.SEGWIT],  # BIP44, external
+    "m/44'/0'/a'/1/i": [ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.SEGWIT],  # BIP44, change
     "m/49'/0'/a'/0/i": [ScriptType.COMPAT],  # BIP49, external
     "m/49'/0'/a'/1/i": [ScriptType.COMPAT],  # BIP49, change
     "m/84'/0'/a'/0/i": [ScriptType.SEGWIT],  # BIP84, external
@@ -33,8 +35,6 @@ descriptors = {
     "m/84'/0'/2147483645'/1/i": [ScriptType.SEGWIT],  # Samourai pre-mix, change
     "m/84'/0'/2147483644'/0/i": [ScriptType.SEGWIT],  # Samourai bad-bank, external
     "m/84'/0'/2147483644'/1/i": [ScriptType.SEGWIT],  # Samourai bad-bank, change
-    "m/44'/0'/0'/0/i": [ScriptType.SEGWIT],  # Copay segwit, external
-    "m/44'/0'/0'/1/i": [ScriptType.SEGWIT],  # Copay segwit, change
 }
 
 
