@@ -61,6 +61,40 @@ class TestServerList(unittest.TestCase):
             self.assertIn('port', server)
 
 
+class TestElectrumProtocol(unittest.TestCase):
+    """
+    The protocol version the client offers when it connects.
+    """
+
+    def test_the_scan_offers_a_range_of_protocol_versions(self) -> None:
+        # Demanding a single version shuts out every server that speaks an earlier one
+        built = []
+
+        class FakeClient:
+            """
+            Electrum client that records how it was built and refuses to connect.
+            """
+
+            def __init__(self, **kwargs: object) -> None:
+                built.append(kwargs)
+
+            async def connect(self, *args: object, **kwargs: object) -> None:
+                raise ConnectionError('Not connecting in a test')
+
+        async def scan() -> None:
+            with self.assertRaises(ConnectionError):
+                await indy.find_utxos(None, None, 20, 0, None, None, False, True)
+
+        with mock.patch.object(indy, 'StratumClient', FakeClient):
+            with redirect_stdout(io.StringIO()):
+                asyncio.run(scan())
+
+        self.assertEqual(built, [{'my_proto_version': indy.ELECTRUM_PROTOCOL_VERSIONS}])
+
+    def test_the_range_starts_below_the_newest_version(self) -> None:
+        self.assertEqual(indy.ELECTRUM_PROTOCOL_VERSIONS, ['1.4', '1.4.2'])
+
+
 class TestEventLoop(unittest.TestCase):
     """
     The event loop the scan runs on.

@@ -15,6 +15,9 @@ from mnemonic import Mnemonic
 import scanner
 import transactions
 
+# Offered to the server as a range, since not every server speaks the newest protocol
+ELECTRUM_PROTOCOL_VERSIONS = ['1.4', '1.4.2']
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -131,7 +134,7 @@ async def find_utxos(
     """
     print('⏳  Connecting to electrum server, this might take a while')
 
-    client = StratumClient()
+    client = StratumClient(my_proto_version=ELECTRUM_PROTOCOL_VERSIONS)
     await client.connect(server, disable_cert_verify=True)
 
     print('🌍  Connected to electrum server successfully')
