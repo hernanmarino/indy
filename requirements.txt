@@ -1,6 +1,7 @@
 bip32==0.0.7
 mnemonic==0.19
 bech32==1.2.0
+base58==2.0.0
 coincurve==13.0.0
 git+https://github.com/esneider/connectrum.git#egg=connectrum
 tqdm==4.66.3
