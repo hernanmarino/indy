@@ -75,8 +75,10 @@ class Transaction:
         """
         witness_tx = _serialize_tx(self.inputs, self.outputs)
         non_witness_tx = _serialize_tx(self.inputs, self.outputs, include_witness=False)
+        weight = 3 * len(non_witness_tx) + len(witness_tx)
 
-        return (3 * len(non_witness_tx) + len(witness_tx)) // 4
+        # BIP141 rounds the weight up to the next whole virtual byte
+        return (weight + 3) // 4
 
     def to_bytes(self) -> bytes:
         """

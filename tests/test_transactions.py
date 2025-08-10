@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import math
 import unittest
 from typing import List, Tuple
 from unittest import mock
@@ -26,6 +27,16 @@ def _master_key() -> BIP32:
 def _utxo(amount_in_sat: int, script_type: ScriptType = ScriptType.SEGWIT) -> scanner.Utxo:
     txid = '77541aeb3c4dac9260b68f74f44c973081a9d4cb2ebe8038b2d70faa201b6bdb'
     return scanner.Utxo(txid, 1, amount_in_sat, Path("m/84'/0'/0'/0/0"), script_type)
+
+
+def _weight_of(tx: transactions.Transaction) -> int:
+    """
+    Compute the weight of a transaction, as three times its base size plus its total size.
+    """
+    base = len(transactions._serialize_tx(tx.inputs, tx.outputs, include_witness=False))
+    total = len(transactions._serialize_tx(tx.inputs, tx.outputs))
+
+    return 3 * base + total
 
 
 def _signing_digest(tx: transactions.Transaction, index: int, master_key: BIP32) -> bytes:
@@ -194,12 +205,37 @@ class TestTransaction(unittest.TestCase):
         tx = transactions.Transaction(_master_key(), [_utxo(100_000)], DESTINATION, 90_000)
         self.assertLess(tx.virtual_size(), len(tx.to_bytes()))
 
-    def test_virtual_size_of_a_single_p2wpkh_input(self) -> None:
-        # TODO: this rounds the weight down, while BIP141 defines vsize as the weight rounded up
+    def test_virtual_size_rounds_the_weight_up(self) -> None:
+        # BIP141 defines vsize as the weight divided by four and rounded up
         tx = transactions.Transaction(_master_key(), [_utxo(100_000)], DESTINATION, 90_000)
-        witness = len(transactions._serialize_tx(tx.inputs, tx.outputs))
-        base = len(transactions._serialize_tx(tx.inputs, tx.outputs, include_witness=False))
-        self.assertEqual(tx.virtual_size(), (3 * base + witness) // 4)
+
+        self.assertEqual(tx.virtual_size(), math.ceil(_weight_of(tx) / 4))
+
+    def test_virtual_size_never_understates_the_weight(self) -> None:
+        # Understating it by even one byte pays a fee below the rate that was asked for
+        for script_type in [ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.SEGWIT]:
+            tx = transactions.Transaction(_master_key(), [_utxo(100_000, script_type)], DESTINATION, 90_000)
+
+            self.assertGreaterEqual(4 * tx.virtual_size(), _weight_of(tx), script_type.name)
+
+    def test_virtual_size_rounds_up_whatever_the_weight_leaves_over(self) -> None:
+        # Mixing input types reaches weights that are one, two and three over a whole virtual byte
+        mixes = [
+            [ScriptType.LEGACY],
+            [ScriptType.COMPAT],
+            [ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.COMPAT],
+            [ScriptType.LEGACY, ScriptType.LEGACY, ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.COMPAT],
+        ]
+        remainders = set()
+
+        for mix in mixes:
+            tx = transactions.Transaction(_master_key(), [_utxo(100_000, t) for t in mix], DESTINATION, 90_000)
+            weight = _weight_of(tx)
+            remainders.add(weight % 4)
+
+            self.assertEqual(tx.virtual_size(), math.ceil(weight / 4), [t.name for t in mix])
+
+        self.assertIn(1, remainders, 'No mix left a weight one over a whole virtual byte')
 
     def test_every_signature_verifies_against_the_pubkey_it_ships_with(self) -> None:
         master_key = _master_key()
