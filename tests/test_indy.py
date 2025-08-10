@@ -10,9 +10,13 @@ from contextlib import redirect_stdout
 from typing import List, Tuple
 from unittest import mock
 
+from bip32 import BIP32
 from connectrum.client import StratumClient
 
 import indy
+import scanner
+from descriptors import Path
+from scripts import ScriptType
 
 # Master private key from the BIP32 test vector 1
 BIP32_TEST_XPRIV = ('xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvv'
@@ -93,6 +97,62 @@ class TestElectrumProtocol(unittest.TestCase):
 
     def test_the_range_starts_below_the_newest_version(self) -> None:
         self.assertEqual(indy.ELECTRUM_PROTOCOL_VERSIONS, ['1.4', '1.4.2'])
+
+
+class TestFeeRate(unittest.TestCase):
+    """
+    Conversion of the fee rate an electrum server reports.
+    """
+
+    def test_a_kilobyte_is_a_thousand_bytes(self) -> None:
+        # The electrum protocol reports BTC per 1000 bytes, not per 1024
+        self.assertEqual(indy._fee_rate_in_sat_per_vbyte(0.001), 100)
+
+    def test_the_conversion_scales(self) -> None:
+        self.assertEqual(indy._fee_rate_in_sat_per_vbyte(0.00001), 1)
+        self.assertEqual(indy._fee_rate_in_sat_per_vbyte(0.01), 1_000)
+
+    def test_a_whole_rate_does_not_lose_a_satoshi_to_binary_floats(self) -> None:
+        # Scaling the binary value of 0.00007 lands just under 7, and truncating it gives back 6
+        for rate in range(1, 1_001):
+            self.assertEqual(indy._fee_rate_in_sat_per_vbyte(rate / 100_000), rate)
+
+    def test_a_fractional_rate_is_truncated(self) -> None:
+        self.assertEqual(indy._fee_rate_in_sat_per_vbyte(0.000105), 10)
+
+    def test_the_scan_builds_its_fee_from_the_converted_rate(self) -> None:
+        # 0.00007 BTC per thousand bytes is exactly 7 sat/vB, and is one of the rates that a binary
+        # float drops a satoshi on, so this covers the conversion and the precision at once
+        master_key = BIP32.from_seed(bytes.fromhex('000102030405060708090a0b0c0d0e0f'))
+        utxo = scanner.Utxo('ab' * 32, 0, 1_000_000, Path("m/84'/0'/0'/0/0"), ScriptType.SEGWIT)
+
+        class FakeClient:
+            """
+            Electrum client that quotes a fee rate and nothing else.
+            """
+
+            async def connect(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            async def RPC(self, method: str, *params: object) -> float:
+                assert method == 'blockchain.estimatefee', method
+                return 0.00007
+
+            def close(self) -> None:
+                pass
+
+        async def scan(*args: object) -> List[scanner.Utxo]:
+            return [utxo]
+
+        output = io.StringIO()
+        destination = 'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4'
+
+        with mock.patch.object(indy, 'StratumClient', lambda **kwargs: FakeClient()), \
+             mock.patch.object(scanner, 'scan_master_key', scan):
+            with redirect_stdout(output):
+                asyncio.run(indy.find_utxos(None, master_key, 20, 0, destination, None, False, True))
+
+        self.assertIn('7 sat/vbyte', output.getvalue())
 
 
 class TestEventLoop(unittest.TestCase):

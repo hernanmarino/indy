@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import random
+from decimal import Decimal
 from typing import List, Optional
 
 import connectrum
@@ -17,6 +18,9 @@ import transactions
 
 # Offered to the server as a range, since not every server speaks the newest protocol
 ELECTRUM_PROTOCOL_VERSIONS = ['1.4', '1.4.2']
+
+SATOSHIS_PER_BITCOIN = 10 ** 8
+BYTES_PER_KILOBYTE = 1_000
 
 
 def main():
@@ -77,6 +81,15 @@ def main():
         args.broadcast,
         not args.no_batching
     ))
+
+
+def _fee_rate_in_sat_per_vbyte(fee_rate_in_btc_per_kb: float) -> int:
+    """
+    Convert the fee rate an electrum server reports into satoshis per virtual byte.
+    """
+    # The rate arrives as a float, so it is read as the decimal it prints as: scaling the binary
+    # value drops whole satoshis
+    return int(Decimal(str(fee_rate_in_btc_per_kb)) * SATOSHIS_PER_BITCOIN / BYTES_PER_KILOBYTE)
 
 
 def read_servers() -> List[dict]:
@@ -167,7 +180,7 @@ async def find_utxos(
             client.close()
             return
 
-        fee_rate = int(fee_rate_in_btc_per_kb * 10 ** 8 / 1024)
+        fee_rate = _fee_rate_in_sat_per_vbyte(fee_rate_in_btc_per_kb)
 
         print(f'🚌  Fetched next-block fee rate of {fee_rate} sat/vbyte')
 
