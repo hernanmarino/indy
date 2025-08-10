@@ -68,7 +68,7 @@ def main():
         port = (args.protocol + str(args.port)) if args.port else args.protocol
         server = ServerInfo(args.host, hostname=args.host, ports=port)
     else:
-        server = random.choice(read_servers())
+        server = random.choice(_read_servers())
         server = ServerInfo(server['host'], hostname=server['host'], ports=server['port'])
 
     asyncio.run(find_utxos(
@@ -92,7 +92,7 @@ def _fee_rate_in_sat_per_vbyte(fee_rate_in_btc_per_kb: float) -> int:
     return int(Decimal(str(fee_rate_in_btc_per_kb)) * SATOSHIS_PER_BITCOIN / BYTES_PER_KILOBYTE)
 
 
-def read_servers() -> List[dict]:
+def _read_servers() -> List[dict]:
     """
     Read the bundled list of electrum servers, wherever the tool was started from.
     """

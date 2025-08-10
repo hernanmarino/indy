@@ -51,7 +51,7 @@ class TestServerList(unittest.TestCase):
         previous = os.getcwd()
         os.chdir(directory)
         try:
-            return indy.read_servers()
+            return indy._read_servers()
         finally:
             os.chdir(previous)
 
@@ -60,7 +60,7 @@ class TestServerList(unittest.TestCase):
             return self._read_servers_from(os.path.dirname(module_path))
 
     def test_every_server_declares_a_host_and_a_port(self) -> None:
-        for server in indy.read_servers():
+        for server in indy._read_servers():
             self.assertIn('host', server)
             self.assertIn('port', server)
 
