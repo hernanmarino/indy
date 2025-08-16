@@ -51,6 +51,8 @@ def main():
                           help='fee rate to use in sat/vbyte (default: next block fee)')
     sweep_tx.add_argument('--allow-high-fee', default=False, action='store_true',
                           help=f'allow a fee above {int(100 * MAX_FEE_SHARE_OF_BALANCE)}%% of the funds found')
+    sweep_tx.add_argument('--yes', default=False, action='store_true',
+                          help='broadcast without asking for confirmation')
 
     scanning = parser.add_argument_group('scanning parameters')
 
@@ -90,7 +92,8 @@ def main():
         args.fee_rate,
         args.broadcast,
         not args.no_batching,
-        args.allow_high_fee
+        args.allow_high_fee,
+        args.yes
     ))
 
 
@@ -101,6 +104,13 @@ def _fee_rate_in_sat_per_vbyte(fee_rate_in_btc_per_kb: float) -> int:
     # The rate arrives as a float, so it is read as the decimal it prints as: scaling the binary
     # value drops whole satoshis
     return int(Decimal(str(fee_rate_in_btc_per_kb)) * SATOSHIS_PER_BITCOIN / BYTES_PER_KILOBYTE)
+
+
+def _confirmed() -> bool:
+    """
+    Ask before the sweep leaves the machine, since nothing can be undone afterwards.
+    """
+    return input('❓  Broadcast this transaction? [y/N] ').strip().lower() == 'y'
 
 
 def _quoted_fee_rate(quoted_btc_per_kb: object) -> Optional[int]:
@@ -169,7 +179,8 @@ async def find_utxos(
         fee_rate: Optional[int],
         should_broadcast: bool,
         should_batch: bool,
-        allow_high_fee: bool = False
+        allow_high_fee: bool = False,
+        assume_yes: bool = False
 ):
     """
     Connect to an electrum server and find all the UTXOs spendable by a master key.
@@ -236,14 +247,27 @@ async def find_utxos(
 
     tx = transactions.Transaction(master_key, utxos, address, balance - fee)
     bin_tx = tx.to_bytes()
-
+    # Signing the real transaction can land on a signature a byte or two off the provisional one,
+    # so the rate it ends up paying is close to the one asked for rather than exactly it
+    paid_rate = fee / tx.virtual_size()
 
     print('👇  This transaction sweeps all funds to the address provided')
+    print()
+    print(f'    To:    {address}')
+    print(f'    Sends: {balance - fee} sats')
+    print(f'    Fee:   {fee} sats, at {paid_rate:.2f} sat/vbyte, '
+          f'{100 * fee / balance:.1f}% of the {balance} sats found')
+    print()
     print(bin_tx.hex())
     print()
 
     if not should_broadcast:
         print('📋  Copy this transaction and broadcast it manually to the network, or re-run with `--broadcast`')
+        client.close()
+        return
+
+    if not assume_yes and not _confirmed():
+        print('🚫  Left alone, nothing was broadcast')
         client.close()
         return
 

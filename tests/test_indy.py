@@ -169,6 +169,78 @@ class TestFeeBounds(unittest.TestCase):
         self.assertIn('sweeps all funds', sweep.output)
 
 
+class TestSweepSummary(unittest.TestCase):
+    """
+    What the user is shown before a sweep is transmitted.
+    """
+
+    def test_the_summary_names_the_destination_and_the_amounts(self) -> None:
+        sweep = _sweep(quoted_rate=0.0001, balance=1_000_000)
+
+        self.assertIn(f'To:    {DESTINATION}', sweep.output)
+        self.assertIn('Sends: 998900 sats', sweep.output)
+        self.assertIn('Fee:   1100 sats, at 10.00 sat/vbyte', sweep.output)
+
+    def test_the_summary_reports_the_rate_the_transaction_really_pays(self) -> None:
+        # The provisional transaction used to size the fee can differ from the signed one by a
+        # byte, so the rate printed is the one the final transaction works out to
+        sweep = _sweep(quoted_rate=None, fee_rate=1, balance=102_400)
+
+        self.assertIn('Fee:   109 sats, at 0.99 sat/vbyte', sweep.output)
+
+    def test_the_summary_says_what_share_of_the_funds_the_fee_is(self) -> None:
+        sweep = _sweep(quoted_rate=0.0001, balance=1_000_000)
+
+        self.assertIn('0.1%', sweep.output)
+
+    def test_nothing_is_asked_when_the_transaction_is_not_broadcast(self) -> None:
+        sweep = _sweep(quoted_rate=0.0001)
+
+        self.assertFalse(sweep.was_asked)
+
+    def test_broadcasting_asks_first(self) -> None:
+        sweep = _sweep(quoted_rate=0.0001, should_broadcast=True, answer='y')
+
+        self.assertTrue(sweep.was_asked)
+        self.assertTrue(sweep.reached_the_network)
+
+    def test_anything_other_than_yes_holds_the_transaction_back(self) -> None:
+        for answer in ['', 'n', 'no', 'Y E S', 'yeah']:
+            sweep = _sweep(quoted_rate=0.0001, should_broadcast=True, answer=answer)
+
+            self.assertFalse(sweep.reached_the_network, repr(answer))
+
+    def test_yes_in_any_case_goes_ahead(self) -> None:
+        for answer in ['y', 'Y', ' y ']:
+            sweep = _sweep(quoted_rate=0.0001, should_broadcast=True, answer=answer)
+
+            self.assertTrue(sweep.reached_the_network, repr(answer))
+
+    def test_saying_no_reaches_the_network_with_nothing_at_all(self) -> None:
+        sweep = _sweep(quoted_rate=0.0001, should_broadcast=True, answer='n')
+
+        self.assertTrue(sweep.was_asked)
+        self.assertEqual(sweep.broadcast, [])
+
+    def test_the_question_comes_before_the_transaction_leaves(self) -> None:
+        sweep = _sweep(quoted_rate=0.0001, should_broadcast=True, answer='y')
+
+        self.assertLess(sweep.events.index('asked'),
+                        sweep.events.index('blockchain.transaction.broadcast'))
+
+    def test_what_is_broadcast_is_the_transaction_that_was_shown(self) -> None:
+        sweep = _sweep(quoted_rate=0.0001, should_broadcast=True, answer='y')
+
+        self.assertEqual(len(sweep.broadcast), 1)
+        self.assertIn(sweep.broadcast[0], sweep.output.splitlines())
+
+    def test_the_question_can_be_answered_up_front(self) -> None:
+        sweep = _sweep(quoted_rate=0.0001, should_broadcast=True, assume_yes=True)
+
+        self.assertFalse(sweep.was_asked)
+        self.assertTrue(sweep.reached_the_network)
+
+
 class TestServerList(unittest.TestCase):
     """
     The bundled list of Electrum servers.
@@ -325,6 +397,28 @@ class TestEventLoop(unittest.TestCase):
                 indy.main()
 
         self.assertEqual(len(started), 1)
+
+    def test_the_sweep_flags_reach_the_scan(self) -> None:
+        captured = []
+
+        async def find_utxos(*args: object) -> None:
+            captured.append(args)
+
+        command = ['indy.py', BIP32_TEST_XPRIV, '--host', 'example.invalid']
+
+        for flags, allow_high_fee, assume_yes in [([], False, False),
+                                                  (['--yes'], False, True),
+                                                  (['--allow-high-fee'], True, False),
+                                                  (['--yes', '--allow-high-fee'], True, True)]:
+            captured.clear()
+            asyncio.set_event_loop(None)
+
+            with mock.patch.object(indy, 'find_utxos', find_utxos), \
+                 mock.patch.object(sys, 'argv', command + flags):
+                with redirect_stdout(io.StringIO()):
+                    indy.main()
+
+            self.assertEqual(captured[0][-2:], (allow_high_fee, assume_yes), flags)
 
     def test_the_electrum_client_takes_the_loop_it_is_built_inside(self) -> None:
         # The client reaches for the running loop in its constructor, so it has to be built from
