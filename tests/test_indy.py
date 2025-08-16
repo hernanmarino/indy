@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 from unittest import mock
 
 from bip32 import BIP32
@@ -16,11 +16,229 @@ from connectrum.client import StratumClient
 import indy
 import scanner
 from descriptors import Path
+from indy import MAX_FEE_RATE
 from scripts import ScriptType
 
 # Master private key from the BIP32 test vector 1
 BIP32_TEST_XPRIV = ('xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvv'
                     'NKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi')
+
+# Destination address from the BIP173 test vectors
+DESTINATION = 'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4'
+
+
+class Sweep:
+    """
+    What a sweep did: what the user saw, what was asked of the server, and in which order.
+    """
+
+    def __init__(self, output: str, events: List[str], broadcast: List[str]) -> None:
+        self.output = output
+        self.events = events
+        self.broadcast = broadcast
+        self.was_asked = 'asked' in events
+        self.reached_the_network = bool(broadcast)
+
+
+def _sweep(quoted_rate: object, balance: int = 1_000_000, answer: Optional[str] = None, **options: object) -> Sweep:
+    """
+    Run a whole sweep against a server quoting a fee rate, and record everything it did.
+    """
+    master_key = BIP32.from_seed(bytes.fromhex('000102030405060708090a0b0c0d0e0f'))
+    utxo = scanner.Utxo('ab' * 32, 0, balance, Path("m/84'/0'/0'/0/0"), ScriptType.SEGWIT)
+    events: List[str] = []
+    broadcast: List[str] = []
+
+    class FakeClient:
+        """
+        Electrum client that quotes a fee rate and records what it is asked to broadcast.
+        """
+
+        async def connect(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def RPC(self, method: str, *params: object) -> object:
+            events.append(method)
+
+            if method == 'blockchain.estimatefee':
+                return quoted_rate
+
+            if method == 'blockchain.transaction.broadcast':
+                broadcast.append(params[0])
+                return 'cd' * 32
+
+            raise AssertionError(f'The sweep asked for an unknown method: {method}')
+
+        def close(self) -> None:
+            pass
+
+    async def scan(*args: object) -> List[scanner.Utxo]:
+        return [utxo]
+
+    def ask(prompt: str) -> str:
+        events.append('asked')
+        return answer if answer is not None else ''
+
+    output = io.StringIO()
+    settings = {'address': DESTINATION, 'fee_rate': None, 'should_broadcast': False}
+    settings.update(options)
+
+    with mock.patch.object(indy, 'StratumClient', lambda **kwargs: FakeClient()), \
+         mock.patch.object(scanner, 'scan_master_key', scan), \
+         mock.patch('builtins.input', ask):
+        with redirect_stdout(output):
+            asyncio.run(indy.find_utxos(None, master_key, 20, 0, should_batch=True, **settings))
+
+    return Sweep(output.getvalue(), events, broadcast)
+
+
+class TestFeeBounds(unittest.TestCase):
+    """
+    Limits on the fee a sweep is allowed to pay.
+    """
+
+    def test_a_rate_the_server_quotes_absurdly_high_is_refused(self) -> None:
+        # A server quoting 9.0 BTC/kB hands back 900000 sat/vbyte, which on a whole bitcoin leaves
+        # a hundredth of it and gives the rest away
+        sweep = _sweep(quoted_rate=9.0, balance=100_000_000)
+
+        self.assertNotIn('sweeps all funds', sweep.output)
+        self.assertIn('sat/vbyte', sweep.output)
+
+    def test_a_rate_over_the_ceiling_is_refused_even_when_the_balance_absorbs_it(self) -> None:
+        # 5000 sat/vbyte on a whole bitcoin is half a percent of it, so the share cap lets it by and
+        # the ceiling on the rate is the only thing left between the funds and the miner
+        sweep = _sweep(quoted_rate=0.05, balance=100_000_000)
+
+        self.assertNotIn('sweeps all funds', sweep.output)
+
+    def test_a_rate_given_by_hand_is_held_to_the_same_range(self) -> None:
+        for by_hand in [-1, 0, MAX_FEE_RATE + 1, 900_000]:
+            sweep = _sweep(quoted_rate=None, fee_rate=by_hand)
+
+            self.assertNotIn('sweeps all funds', sweep.output, f'--fee-rate {by_hand}')
+
+    def test_a_whole_number_too_large_to_weigh_is_refused(self) -> None:
+        # An integer this size cannot even be compared against a float without raising
+        sweep = _sweep(quoted_rate=10 ** 1000)
+
+        self.assertNotIn('sweeps all funds', sweep.output)
+
+    def test_a_rate_of_zero_is_refused(self) -> None:
+        sweep = _sweep(quoted_rate=0.0000001)
+
+        self.assertNotIn('sweeps all funds', sweep.output)
+
+    def test_a_rate_that_is_not_a_number_is_refused(self) -> None:
+        for quoted in ['not a rate', None, float('nan'), float('inf')]:
+            sweep = _sweep(quoted_rate=quoted)
+
+            self.assertNotIn('sweeps all funds', sweep.output, repr(quoted))
+
+    def test_a_fee_over_the_share_of_the_balance_is_refused(self) -> None:
+        # 800 sat/vbyte on a 110 vbyte sweep is 88000 sats, well over a tenth of this balance
+        sweep = _sweep(quoted_rate=None, fee_rate=800, balance=200_000)
+
+        self.assertNotIn('sweeps all funds', sweep.output)
+
+    def test_that_fee_goes_through_when_it_is_allowed(self) -> None:
+        sweep = _sweep(quoted_rate=None, fee_rate=800, balance=200_000, allow_high_fee=True)
+
+        self.assertIn('sweeps all funds', sweep.output)
+
+    def test_a_rate_of_exactly_the_ceiling_is_allowed(self) -> None:
+        # Large enough that the fee at this rate is well under a tenth of it
+        sweep = _sweep(quoted_rate=None, fee_rate=MAX_FEE_RATE, balance=10_000_000)
+
+        self.assertIn('sweeps all funds', sweep.output)
+
+    def test_a_fee_of_exactly_the_share_is_allowed(self) -> None:
+        # This sweep costs 110 vbytes, so at 10 sat/vbyte the fee is exactly a tenth of 11000
+        sweep = _sweep(quoted_rate=None, fee_rate=10, balance=11_000)
+
+        self.assertIn('sweeps all funds', sweep.output)
+
+    def test_a_fee_one_satoshi_over_the_share_is_refused(self) -> None:
+        sweep = _sweep(quoted_rate=None, fee_rate=10, balance=10_999)
+
+        self.assertNotIn('sweeps all funds', sweep.output)
+
+    def test_an_ordinary_rate_goes_through(self) -> None:
+        sweep = _sweep(quoted_rate=0.0001)
+
+        self.assertIn('sweeps all funds', sweep.output)
+
+
+class TestSweepSummary(unittest.TestCase):
+    """
+    What the user is shown before a sweep is transmitted.
+    """
+
+    def test_the_summary_names_the_destination_and_the_amounts(self) -> None:
+        sweep = _sweep(quoted_rate=0.0001, balance=1_000_000)
+
+        self.assertIn(f'To:    {DESTINATION}', sweep.output)
+        self.assertIn('Sends: 998900 sats', sweep.output)
+        self.assertIn('Fee:   1100 sats, at 10.00 sat/vbyte', sweep.output)
+
+    def test_the_summary_reports_the_rate_the_transaction_really_pays(self) -> None:
+        # The provisional transaction used to size the fee can differ from the signed one by a
+        # byte, so the rate printed is the one the final transaction works out to
+        sweep = _sweep(quoted_rate=None, fee_rate=1, balance=102_400)
+
+        self.assertIn('Fee:   109 sats, at 0.99 sat/vbyte', sweep.output)
+
+    def test_the_summary_says_what_share_of_the_funds_the_fee_is(self) -> None:
+        sweep = _sweep(quoted_rate=0.0001, balance=1_000_000)
+
+        self.assertIn('0.1%', sweep.output)
+
+    def test_nothing_is_asked_when_the_transaction_is_not_broadcast(self) -> None:
+        sweep = _sweep(quoted_rate=0.0001)
+
+        self.assertFalse(sweep.was_asked)
+
+    def test_broadcasting_asks_first(self) -> None:
+        sweep = _sweep(quoted_rate=0.0001, should_broadcast=True, answer='y')
+
+        self.assertTrue(sweep.was_asked)
+        self.assertTrue(sweep.reached_the_network)
+
+    def test_anything_other_than_yes_holds_the_transaction_back(self) -> None:
+        for answer in ['', 'n', 'no', 'Y E S', 'yeah']:
+            sweep = _sweep(quoted_rate=0.0001, should_broadcast=True, answer=answer)
+
+            self.assertFalse(sweep.reached_the_network, repr(answer))
+
+    def test_yes_in_any_case_goes_ahead(self) -> None:
+        for answer in ['y', 'Y', ' y ']:
+            sweep = _sweep(quoted_rate=0.0001, should_broadcast=True, answer=answer)
+
+            self.assertTrue(sweep.reached_the_network, repr(answer))
+
+    def test_saying_no_reaches_the_network_with_nothing_at_all(self) -> None:
+        sweep = _sweep(quoted_rate=0.0001, should_broadcast=True, answer='n')
+
+        self.assertTrue(sweep.was_asked)
+        self.assertEqual(sweep.broadcast, [])
+
+    def test_the_question_comes_before_the_transaction_leaves(self) -> None:
+        sweep = _sweep(quoted_rate=0.0001, should_broadcast=True, answer='y')
+
+        self.assertLess(sweep.events.index('asked'),
+                        sweep.events.index('blockchain.transaction.broadcast'))
+
+    def test_what_is_broadcast_is_the_transaction_that_was_shown(self) -> None:
+        sweep = _sweep(quoted_rate=0.0001, should_broadcast=True, answer='y')
+
+        self.assertEqual(len(sweep.broadcast), 1)
+        self.assertIn(sweep.broadcast[0], sweep.output.splitlines())
+
+    def test_the_question_can_be_answered_up_front(self) -> None:
+        sweep = _sweep(quoted_rate=0.0001, should_broadcast=True, assume_yes=True)
+
+        self.assertFalse(sweep.was_asked)
+        self.assertTrue(sweep.reached_the_network)
 
 
 class TestServerList(unittest.TestCase):
@@ -179,6 +397,28 @@ class TestEventLoop(unittest.TestCase):
                 indy.main()
 
         self.assertEqual(len(started), 1)
+
+    def test_the_sweep_flags_reach_the_scan(self) -> None:
+        captured = []
+
+        async def find_utxos(*args: object) -> None:
+            captured.append(args)
+
+        command = ['indy.py', BIP32_TEST_XPRIV, '--host', 'example.invalid']
+
+        for flags, allow_high_fee, assume_yes in [([], False, False),
+                                                  (['--yes'], False, True),
+                                                  (['--allow-high-fee'], True, False),
+                                                  (['--yes', '--allow-high-fee'], True, True)]:
+            captured.clear()
+            asyncio.set_event_loop(None)
+
+            with mock.patch.object(indy, 'find_utxos', find_utxos), \
+                 mock.patch.object(sys, 'argv', command + flags):
+                with redirect_stdout(io.StringIO()):
+                    indy.main()
+
+            self.assertEqual(captured[0][-2:], (allow_high_fee, assume_yes), flags)
 
     def test_the_electrum_client_takes_the_loop_it_is_built_inside(self) -> None:
         # The client reaches for the running loop in its constructor, so it has to be built from
