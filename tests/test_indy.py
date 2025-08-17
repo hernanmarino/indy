@@ -12,6 +12,7 @@ from unittest import mock
 
 from bip32 import BIP32
 from connectrum.client import StratumClient
+from mnemonic import Mnemonic
 
 import indy
 import scanner
@@ -90,6 +91,62 @@ def _sweep(quoted_rate: object, balance: int = 1_000_000, answer: Optional[str] 
             asyncio.run(indy.find_utxos(None, master_key, 20, 0, should_batch=True, **settings))
 
     return Sweep(output.getvalue(), events, broadcast)
+
+
+class TestKeyParsing(unittest.TestCase):
+    """
+    Reading the key a recovery starts from.
+    """
+
+    VALID = ('abandon abandon abandon abandon abandon abandon '
+             'abandon abandon abandon abandon abandon about')
+    BROKEN_CHECKSUM = 'abandon ' * 11 + 'abandon'
+    ONE_WORD_OFF = VALID.replace('about', 'abandon')
+
+    def _parse(self, key: str, **options: object) -> object:
+        with redirect_stdout(io.StringIO()):
+            return indy.parse_key(key, '', **options)
+
+    def test_a_mnemonic_that_checks_out_is_read(self) -> None:
+        self.assertIsNotNone(self._parse(self.VALID))
+
+    def test_a_phrase_read_as_the_wrong_language_still_checks_out(self) -> None:
+        # Wordlists overlap, and the library settles on the first that fits every word: this very
+        # phrase, the BIP39 test vector, reads as French, where its checksum does not match
+        self.assertEqual(Mnemonic.detect_language(self.VALID), 'french')
+
+        self.assertIsNotNone(self._parse(self.VALID))
+
+    def test_a_phrase_in_another_language_is_read(self) -> None:
+        for language in ['spanish', 'french', 'japanese', 'italian']:
+            self.assertIsNotNone(self._parse(Mnemonic(language).generate(128)), language)
+
+    def test_a_mnemonic_whose_checksum_does_not_check_out_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self._parse(self.BROKEN_CHECKSUM)
+
+    def test_one_wrong_word_is_refused_rather_than_read_as_another_wallet(self) -> None:
+        # Every word is in the list and the phrase parses, so nothing but the checksum catches this
+        with self.assertRaises(ValueError):
+            self._parse(self.ONE_WORD_OFF)
+
+    def test_the_refusal_says_what_to_look_at(self) -> None:
+        with self.assertRaises(ValueError) as refused:
+            self._parse(self.ONE_WORD_OFF)
+
+        message = str(refused.exception).lower()
+        self.assertIn('checksum', message)
+        self.assertIn('electrum', message)
+
+    def test_a_checksum_can_be_overridden_for_a_phrase_from_elsewhere(self) -> None:
+        self.assertIsNotNone(self._parse(self.BROKEN_CHECKSUM, allow_invalid_checksum=True))
+
+    def test_an_extended_key_is_read_without_any_checksum_talk(self) -> None:
+        self.assertIsNotNone(self._parse(BIP32_TEST_XPRIV))
+
+    def test_something_that_is_no_kind_of_key_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self._parse('not a key at all')
 
 
 class TestFeeBounds(unittest.TestCase):
