@@ -37,36 +37,52 @@ python3 indy.py --help
 
 ## Usage
 
+The key is asked for out of sight when it is left off the command line, so that it stays out of
+your shell history and out of `ps`. Use `--ask-passphrase` to be asked for the passphrase the
+same way.
+
 ```
-usage: indy.py [-h] [--passphrase <pass>] [--address <address>] [--broadcast]
-               [--fee-rate <rate>] [--address-gap <num>] [--account-gap <num>]
-               [--host <host>] [--port <port>] [--protocol {t,s}] [--no-batching]
-               key
+usage: indy.py [-h] [--passphrase <pass> | --ask-passphrase]
+               [--allow-invalid-checksum] [--address <address>] [--broadcast]
+               [--fee-rate <rate>] [--allow-high-fee] [--yes]
+               [--address-gap <num>] [--account-gap <num>] [--host <host>]
+               [--port <port>] [--protocol {t,s}] [--no-batching]
+               [key]
 
 Find and sweep all the funds from a mnemonic or bitcoin key, regardless of the
 derivation path or address format used.
 
 positional arguments:
-  key                  master key to sweep, formats: mnemonic, xpriv or xpub
+  key                   master key to sweep, formats: mnemonic, xpriv or xpub
+                        (asked for out of sight if left off)
 
-optional arguments:
-  -h, --help           show this help message and exit
-  --passphrase <pass>  optional secret phrase necessary to decode the mnemonic
+options:
+  -h, --help            show this help message and exit
+  --passphrase <pass>   optional secret phrase necessary to decode the
+                        mnemonic
+  --ask-passphrase      ask for the passphrase out of sight instead of reading
+                        it here
+  --allow-invalid-checksum
+                        derive from a mnemonic whose BIP39 checksum does not
+                        match
 
 sweep transaction:
-  --address <address>  craft a transaction sending all funds to this address
-  --broadcast          if present broadcast the transaction to the network
-  --fee-rate <rate>    fee rate to use in sat/vbyte (default: next block fee)
+  --address <address>   craft a transaction sending all funds to this address
+  --broadcast           if present broadcast the transaction to the network
+  --fee-rate <rate>     fee rate to use in sat/vbyte (default: next block fee)
+  --allow-high-fee      allow a fee above 10% of the funds found
+  --yes                 broadcast without asking for confirmation
 
 scanning parameters:
-  --address-gap <num>  max empty addresses gap to explore (default: 20)
-  --account-gap <num>  max empty account levels gap to explore (default: 0)
+  --address-gap <num>   max empty addresses gap to explore (default: 20)
+  --account-gap <num>   max empty account levels gap to explore (default: 0)
 
 electrum server:
-  --host <host>        hostname of the electrum server to use
-  --port <port>        port number of the electrum server to use
-  --protocol {t,s}     electrum connection protocol: t=TCP, s=SSL (default: s)
-  --no-batching        disable request batching
+  --host <host>         hostname of the electrum server to use
+  --port <port>         port number of the electrum server to use
+  --protocol {t,s}      electrum connection protocol: t=TCP, s=SSL (default:
+                        s)
+  --no-batching         disable request batching
 ```
 
 ## Tests

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 import asyncio
+import getpass
 import io
 import json
 import os
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from typing import List, Optional, Tuple
 from unittest import mock
 
@@ -147,6 +148,115 @@ class TestKeyParsing(unittest.TestCase):
     def test_something_that_is_no_kind_of_key_is_refused(self) -> None:
         with self.assertRaises(ValueError):
             self._parse('not a key at all')
+
+
+class TestSecretInput(unittest.TestCase):
+    """
+    How the key and the passphrase reach the tool.
+    """
+
+    def _run(self, argv: List[str], typed: Optional[List[str]] = None) -> Tuple[str, List[str], Tuple[object, ...]]:
+        """
+        Run main with a given command line, answering any hidden prompt from a list.
+        """
+        answers = list(typed or [])
+        prompts: List[str] = []
+        captured = []
+
+        def hidden(prompt: str = '') -> str:
+            prompts.append(prompt)
+            return answers.pop(0) if answers else ''
+
+        async def find_utxos(*args: object) -> None:
+            captured.append(args)
+
+        output = io.StringIO()
+        asyncio.set_event_loop(None)
+
+        with mock.patch.object(indy, 'find_utxos', find_utxos), \
+             mock.patch.object(getpass, 'getpass', hidden), \
+             mock.patch.object(sys, 'argv', ['indy.py'] + argv):
+            with redirect_stdout(output):
+                indy.main()
+
+        return output.getvalue(), prompts, captured[0] if captured else ()
+
+    def test_a_key_left_off_the_command_line_is_asked_for(self) -> None:
+        output, prompts, _ = self._run(['--host', 'example.invalid'], typed=[BIP32_TEST_XPRIV])
+
+        self.assertEqual(len(prompts), 1)
+        self.assertIn('Read master private key', output)
+
+    def test_a_secret_on_the_command_line_still_works_but_is_warned_about(self) -> None:
+        output, prompts, _ = self._run([TestKeyParsing.VALID, '--host', 'example.invalid'])
+
+        self.assertEqual(prompts, [])
+        self.assertIn('history', output)
+
+    def test_something_that_only_looks_like_a_public_key_still_warns(self) -> None:
+        # The exemption is for a key that really decodes, not for anything spelled like one
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            indy._read_key('xpub-not-really-a-key')
+
+        self.assertIn('history', output.getvalue())
+
+    def test_a_public_key_on_the_command_line_draws_no_warning(self) -> None:
+        public = ('xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ES'
+                  'FjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8')
+        output, _, _ = self._run([public, '--host', 'example.invalid'])
+
+        self.assertNotIn('history', output)
+
+    def test_a_passphrase_can_be_asked_for_instead_of_typed(self) -> None:
+        _, prompts, _ = self._run(['--ask-passphrase', '--host', 'example.invalid'],
+                                  typed=[BIP32_TEST_XPRIV, 'a secret'])
+
+        self.assertEqual(len(prompts), 2)
+
+    def test_the_passphrase_option_will_not_go_without_a_value(self) -> None:
+        # Were it to take an optional value, it would swallow the key standing next to it
+        with self.assertRaises(SystemExit):
+            with redirect_stderr(io.StringIO()):
+                self._run(['--passphrase', '--host', 'example.invalid'])
+
+    def test_asking_for_the_passphrase_leaves_the_key_where_it_is(self) -> None:
+        mnemonic = TestKeyParsing.VALID
+        _, prompts, arguments = self._run([mnemonic, '--ask-passphrase', '--host', 'example.invalid'],
+                                          typed=['a spoken passphrase'])
+
+        with redirect_stdout(io.StringIO()):
+            expected = indy.parse_key(mnemonic, 'a spoken passphrase')
+
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(arguments[1].get_master_xpriv(), expected.get_master_xpriv())
+
+    def test_the_two_ways_of_giving_a_passphrase_are_alternatives(self) -> None:
+        with self.assertRaises(SystemExit):
+            with redirect_stderr(io.StringIO()):
+                self._run([BIP32_TEST_XPRIV, '--passphrase', 'one', '--ask-passphrase'])
+
+    def test_the_checksum_override_reaches_the_derivation(self) -> None:
+        broken = TestKeyParsing.BROKEN_CHECKSUM
+
+        with self.assertRaises(ValueError):
+            self._run([broken, '--host', 'example.invalid'])
+
+        _, _, arguments = self._run([broken, '--allow-invalid-checksum', '--host', 'example.invalid'])
+
+        self.assertTrue(arguments)
+
+    def test_a_passphrase_that_looks_like_a_public_key_is_still_a_secret(self) -> None:
+        output, _, _ = self._run([BIP32_TEST_XPRIV, '--passphrase', 'xpub-but-still-secret',
+                                  '--host', 'example.invalid'])
+
+        self.assertIn('history', output)
+
+    def test_a_passphrase_on_the_command_line_is_warned_about(self) -> None:
+        output, _, _ = self._run([BIP32_TEST_XPRIV, '--passphrase', 'a secret', '--host', 'x.invalid'])
+
+        self.assertIn('history', output)
 
 
 class TestFeeBounds(unittest.TestCase):
