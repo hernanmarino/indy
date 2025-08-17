@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import getpass
 import json
 import math
 import os
@@ -37,9 +38,16 @@ def main():
                     'address format used.'
     )
 
-    parser.add_argument('key', help='master key to sweep, formats: mnemonic, xpriv or xpub')
-    parser.add_argument('--passphrase', metavar='<pass>', default='',
-                        help='optional secret phrase necessary to decode the mnemonic')
+    parser.add_argument('key', nargs='?', default=None,
+                        help='master key to sweep, formats: mnemonic, xpriv or xpub '
+                             '(asked for out of sight if left off)')
+    passphrase_source = parser.add_mutually_exclusive_group()
+    passphrase_source.add_argument('--passphrase', metavar='<pass>', default='',
+                                   help='optional secret phrase necessary to decode the mnemonic')
+    passphrase_source.add_argument('--ask-passphrase', default=False, action='store_true',
+                                   help='ask for the passphrase out of sight instead of reading it here')
+    parser.add_argument('--allow-invalid-checksum', default=False, action='store_true',
+                        help='derive from a mnemonic whose BIP39 checksum does not match')
 
     sweep_tx = parser.add_argument_group('sweep transaction')
 
@@ -74,7 +82,10 @@ def main():
 
     args = parser.parse_args()
 
-    master_key = parse_key(args.key, args.passphrase)
+    key = _read_key(args.key)
+    passphrase = _read_passphrase(args.passphrase, args.ask_passphrase)
+
+    master_key = parse_key(key, passphrase, args.allow_invalid_checksum)
 
     if args.host is not None:
         port = (args.protocol + str(args.port)) if args.port else args.protocol
@@ -140,7 +151,61 @@ def _read_servers() -> List[dict]:
         return json.load(f)
 
 
-def parse_key(key: str, passphrase: str) -> BIP32:
+def _warn_about_the_command_line() -> None:
+    """
+    Say what passing a secret as an argument costs, since it outlives the recovery.
+    """
+    print('⚠️   Passing a secret as an argument leaves it in your shell history and in `ps`')
+    print('    Leave it off the command line to be asked for it instead')
+
+
+def _is_public_key(key: str) -> bool:
+    """
+    Whether this is an extended public key, the one input that is not worth hiding.
+    """
+    try:
+        BIP32.from_xpub(key)
+        return True
+    except Exception:
+        return False
+
+
+def _read_key(given: Optional[str]) -> str:
+    """
+    Take the key from the command line if it is there, and ask for it out of sight if not.
+    """
+    if given is None:
+        return getpass.getpass('Mnemonic, xpriv or xpub: ')
+
+    if not _is_public_key(given):
+        _warn_about_the_command_line()
+
+    return given
+
+
+def _read_passphrase(given: str, should_ask: bool) -> str:
+    """
+    Take the passphrase from the command line, or ask for it out of sight when asked to.
+    """
+    if should_ask:
+        return getpass.getpass('Passphrase: ')
+
+    if given:
+        _warn_about_the_command_line()
+
+    return given
+
+
+def _checksum_matches(words: str) -> bool:
+    """
+    Whether these words carry a valid BIP39 checksum in any of the wordlists.
+    """
+    # Several wordlists share words, and detect_language settles on the first that fits them all,
+    # which is not always the one the phrase was written in: the BIP39 test vector reads as French
+    return any(Mnemonic(language).check(words) for language in Mnemonic.list_languages())
+
+
+def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False) -> BIP32:
     """
     Try to parse an extended key, whether it is in xpub, xpriv or mnemonic format.
     """
@@ -160,12 +225,22 @@ def parse_key(key: str, passphrase: str) -> BIP32:
 
     try:
         language = Mnemonic.detect_language(key)
+    except Exception:
+        language = None
+
+    if language is not None:
+        if not allow_invalid_checksum and not _checksum_matches(key):
+            raise ValueError(
+                'Those words don\'t add up: the BIP39 checksum doesn\'t match, which usually means a '
+                'word was mistyped or two were swapped. An Electrum seed phrase uses the same words '
+                'but is not BIP39, and lands here too. Pass `--allow-invalid-checksum` to derive from '
+                'the words as given anyway.'
+            )
+
         seed = Mnemonic(language).to_seed(key, passphrase=passphrase)
         private_key = BIP32.from_seed(seed)
         print('🔑  Read mnemonic successfully')
         return private_key
-    except Exception:
-        pass
 
     raise ValueError('The key is invalid or the format isn\'t recognized. Make sure it\'s a mnemonic, xpriv or xpub.')
 

@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 import asyncio
+import getpass
 import io
 import json
 import os
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from typing import List, Optional, Tuple
 from unittest import mock
 
 from bip32 import BIP32
 from connectrum.client import StratumClient
+from mnemonic import Mnemonic
 
 import indy
 import scanner
@@ -90,6 +92,171 @@ def _sweep(quoted_rate: object, balance: int = 1_000_000, answer: Optional[str] 
             asyncio.run(indy.find_utxos(None, master_key, 20, 0, should_batch=True, **settings))
 
     return Sweep(output.getvalue(), events, broadcast)
+
+
+class TestKeyParsing(unittest.TestCase):
+    """
+    Reading the key a recovery starts from.
+    """
+
+    VALID = ('abandon abandon abandon abandon abandon abandon '
+             'abandon abandon abandon abandon abandon about')
+    BROKEN_CHECKSUM = 'abandon ' * 11 + 'abandon'
+    ONE_WORD_OFF = VALID.replace('about', 'abandon')
+
+    def _parse(self, key: str, **options: object) -> object:
+        with redirect_stdout(io.StringIO()):
+            return indy.parse_key(key, '', **options)
+
+    def test_a_mnemonic_that_checks_out_is_read(self) -> None:
+        self.assertIsNotNone(self._parse(self.VALID))
+
+    def test_a_phrase_read_as_the_wrong_language_still_checks_out(self) -> None:
+        # Wordlists overlap, and the library settles on the first that fits every word: this very
+        # phrase, the BIP39 test vector, reads as French, where its checksum does not match
+        self.assertEqual(Mnemonic.detect_language(self.VALID), 'french')
+
+        self.assertIsNotNone(self._parse(self.VALID))
+
+    def test_a_phrase_in_another_language_is_read(self) -> None:
+        for language in ['spanish', 'french', 'japanese', 'italian']:
+            self.assertIsNotNone(self._parse(Mnemonic(language).generate(128)), language)
+
+    def test_a_mnemonic_whose_checksum_does_not_check_out_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self._parse(self.BROKEN_CHECKSUM)
+
+    def test_one_wrong_word_is_refused_rather_than_read_as_another_wallet(self) -> None:
+        # Every word is in the list and the phrase parses, so nothing but the checksum catches this
+        with self.assertRaises(ValueError):
+            self._parse(self.ONE_WORD_OFF)
+
+    def test_the_refusal_says_what_to_look_at(self) -> None:
+        with self.assertRaises(ValueError) as refused:
+            self._parse(self.ONE_WORD_OFF)
+
+        message = str(refused.exception).lower()
+        self.assertIn('checksum', message)
+        self.assertIn('electrum', message)
+
+    def test_a_checksum_can_be_overridden_for_a_phrase_from_elsewhere(self) -> None:
+        self.assertIsNotNone(self._parse(self.BROKEN_CHECKSUM, allow_invalid_checksum=True))
+
+    def test_an_extended_key_is_read_without_any_checksum_talk(self) -> None:
+        self.assertIsNotNone(self._parse(BIP32_TEST_XPRIV))
+
+    def test_something_that_is_no_kind_of_key_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self._parse('not a key at all')
+
+
+class TestSecretInput(unittest.TestCase):
+    """
+    How the key and the passphrase reach the tool.
+    """
+
+    def _run(self, argv: List[str], typed: Optional[List[str]] = None) -> Tuple[str, List[str], Tuple[object, ...]]:
+        """
+        Run main with a given command line, answering any hidden prompt from a list.
+        """
+        answers = list(typed or [])
+        prompts: List[str] = []
+        captured = []
+
+        def hidden(prompt: str = '') -> str:
+            prompts.append(prompt)
+            return answers.pop(0) if answers else ''
+
+        async def find_utxos(*args: object) -> None:
+            captured.append(args)
+
+        output = io.StringIO()
+        asyncio.set_event_loop(None)
+
+        with mock.patch.object(indy, 'find_utxos', find_utxos), \
+             mock.patch.object(getpass, 'getpass', hidden), \
+             mock.patch.object(sys, 'argv', ['indy.py'] + argv):
+            with redirect_stdout(output):
+                indy.main()
+
+        return output.getvalue(), prompts, captured[0] if captured else ()
+
+    def test_a_key_left_off_the_command_line_is_asked_for(self) -> None:
+        output, prompts, _ = self._run(['--host', 'example.invalid'], typed=[BIP32_TEST_XPRIV])
+
+        self.assertEqual(len(prompts), 1)
+        self.assertIn('Read master private key', output)
+
+    def test_a_secret_on_the_command_line_still_works_but_is_warned_about(self) -> None:
+        output, prompts, _ = self._run([TestKeyParsing.VALID, '--host', 'example.invalid'])
+
+        self.assertEqual(prompts, [])
+        self.assertIn('history', output)
+
+    def test_something_that_only_looks_like_a_public_key_still_warns(self) -> None:
+        # The exemption is for a key that really decodes, not for anything spelled like one
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            indy._read_key('xpub-not-really-a-key')
+
+        self.assertIn('history', output.getvalue())
+
+    def test_a_public_key_on_the_command_line_draws_no_warning(self) -> None:
+        public = ('xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ES'
+                  'FjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8')
+        output, _, _ = self._run([public, '--host', 'example.invalid'])
+
+        self.assertNotIn('history', output)
+
+    def test_a_passphrase_can_be_asked_for_instead_of_typed(self) -> None:
+        _, prompts, _ = self._run(['--ask-passphrase', '--host', 'example.invalid'],
+                                  typed=[BIP32_TEST_XPRIV, 'a secret'])
+
+        self.assertEqual(len(prompts), 2)
+
+    def test_the_passphrase_option_will_not_go_without_a_value(self) -> None:
+        # Were it to take an optional value, it would swallow the key standing next to it
+        with self.assertRaises(SystemExit):
+            with redirect_stderr(io.StringIO()):
+                self._run(['--passphrase', '--host', 'example.invalid'])
+
+    def test_asking_for_the_passphrase_leaves_the_key_where_it_is(self) -> None:
+        mnemonic = TestKeyParsing.VALID
+        _, prompts, arguments = self._run([mnemonic, '--ask-passphrase', '--host', 'example.invalid'],
+                                          typed=['a spoken passphrase'])
+
+        with redirect_stdout(io.StringIO()):
+            expected = indy.parse_key(mnemonic, 'a spoken passphrase')
+
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(arguments[1].get_master_xpriv(), expected.get_master_xpriv())
+
+    def test_the_two_ways_of_giving_a_passphrase_are_alternatives(self) -> None:
+        with self.assertRaises(SystemExit):
+            with redirect_stderr(io.StringIO()):
+                self._run([BIP32_TEST_XPRIV, '--passphrase', 'one', '--ask-passphrase'])
+
+    def test_the_checksum_override_reaches_the_derivation(self) -> None:
+        broken = TestKeyParsing.BROKEN_CHECKSUM
+
+        with self.assertRaises(ValueError):
+            self._run([broken, '--host', 'example.invalid'])
+
+        _, _, arguments = self._run([broken, '--allow-invalid-checksum', '--host', 'example.invalid'])
+
+        self.assertTrue(arguments)
+
+    def test_a_passphrase_that_looks_like_a_public_key_is_still_a_secret(self) -> None:
+        output, _, _ = self._run([BIP32_TEST_XPRIV, '--passphrase', 'xpub-but-still-secret',
+                                  '--host', 'example.invalid'])
+
+        self.assertIn('history', output)
+
+    def test_a_passphrase_on_the_command_line_is_warned_about(self) -> None:
+        output, _, _ = self._run([BIP32_TEST_XPRIV, '--passphrase', 'a secret', '--host', 'x.invalid'])
+
+        self.assertIn('history', output)
 
 
 class TestFeeBounds(unittest.TestCase):
