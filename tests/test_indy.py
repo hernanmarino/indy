@@ -13,6 +13,7 @@ from unittest import mock
 
 from bip32 import BIP32
 from connectrum.client import StratumClient
+from connectrum.svr_info import ServerInfo
 from mnemonic import Mnemonic
 
 import indy
@@ -24,6 +25,9 @@ from scripts import ScriptType
 # Master private key from the BIP32 test vector 1
 BIP32_TEST_XPRIV = ('xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvv'
                     'NKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi')
+
+# A server reached over TLS, as every server in the bundled list is
+TEST_SERVER = ServerInfo('example.invalid', hostname='example.invalid', ports='s50002')
 
 # Destination address from the BIP173 test vectors
 DESTINATION = 'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4'
@@ -89,7 +93,7 @@ def _sweep(quoted_rate: object, balance: int = 1_000_000, answer: Optional[str] 
          mock.patch.object(scanner, 'scan_master_key', scan), \
          mock.patch('builtins.input', ask):
         with redirect_stdout(output):
-            asyncio.run(indy.find_utxos(None, master_key, 20, 0, should_batch=True, **settings))
+            asyncio.run(indy.find_utxos(TEST_SERVER, master_key, 20, 0, should_batch=True, **settings))
 
     return Sweep(output.getvalue(), events, broadcast)
 
@@ -413,6 +417,20 @@ class TestServerList(unittest.TestCase):
     The bundled list of Electrum servers.
     """
 
+    def test_no_hostname_is_listed_twice(self) -> None:
+        # Whether two names are the same machine is a measurement, not something this can tell
+        hosts = [server['host'].lower().rstrip('.') for server in indy._read_servers()]
+
+        self.assertEqual(len(hosts), len(set(hosts)))
+
+    def test_every_server_is_reached_over_tls(self) -> None:
+        # Read the way the tool reads them: a port field can name more than one transport, and
+        # offering plain TCP alongside TLS leaves the choice to the client
+        for server in indy._read_servers():
+            reachable_by = ServerInfo(server['host'], hostname=server['host'], ports=server['port'])
+
+            self.assertEqual(reachable_by.protocols, {'s'}, server['host'])
+
     def test_is_read_from_wherever_the_tool_was_started(self) -> None:
         with tempfile.TemporaryDirectory() as elsewhere:
             self.assertTrue(self._read_servers_from(elsewhere))
@@ -472,7 +490,7 @@ class TestElectrumProtocol(unittest.TestCase):
 
         async def scan() -> None:
             with self.assertRaises(ConnectionError):
-                await indy.find_utxos(None, None, 20, 0, None, None, False, True)
+                await indy.find_utxos(TEST_SERVER, None, 20, 0, None, None, False, True)
 
         with mock.patch.object(indy, 'StratumClient', FakeClient):
             with redirect_stdout(io.StringIO()):
@@ -535,9 +553,76 @@ class TestFeeRate(unittest.TestCase):
         with mock.patch.object(indy, 'StratumClient', lambda **kwargs: FakeClient()), \
              mock.patch.object(scanner, 'scan_master_key', scan):
             with redirect_stdout(output):
-                asyncio.run(indy.find_utxos(None, master_key, 20, 0, destination, None, False, True))
+                asyncio.run(indy.find_utxos(TEST_SERVER, master_key, 20, 0, destination, None, False, True))
 
         self.assertIn('7 sat/vbyte', output.getvalue())
+
+
+class TestInsecureConnections(unittest.TestCase):
+    """
+    Turning off the protections around the connection to the server.
+    """
+
+    def test_certificates_are_verified_unless_told_otherwise(self) -> None:
+        self.assertFalse(self._connection_options([])['disable_cert_verify'])
+
+    def test_the_insecure_flag_turns_verification_off(self) -> None:
+        self.assertTrue(self._connection_options(['--insecure'])['disable_cert_verify'])
+
+    def test_plain_tcp_is_refused_on_its_own(self) -> None:
+        # It sends every address the scan looks up in the clear, so it is the same choice
+        with self.assertRaises(SystemExit):
+            with redirect_stderr(io.StringIO()):
+                self._connection_options(['--protocol', 't'])
+
+    def test_plain_tcp_goes_through_when_insecure_is_given(self) -> None:
+        self.assertEqual(self._connection_options(['--protocol', 't', '--insecure'])['protocols'], {'t'})
+
+    def test_a_server_offering_both_transports_is_refused(self) -> None:
+        # The client picks one of them on its own, so offering both is offering plain TCP
+        both = [{'host': 'either.invalid', 'port': 's50002 t50001'}]
+
+        with mock.patch.object(indy, '_read_servers', lambda: both):
+            self.assertEqual(self._connection_options([], with_host=False), {})
+
+    def test_a_server_offering_both_transports_goes_through_when_insecure(self) -> None:
+        both = [{'host': 'either.invalid', 'port': 's50002 t50001'}]
+
+        with mock.patch.object(indy, '_read_servers', lambda: both):
+            self.assertTrue(self._connection_options(['--insecure'], with_host=False))
+
+    def _connection_options(self, flags: List[str], with_host: bool = True) -> dict:
+        """
+        Run main with a given command line and report how the client was told to connect.
+        """
+        connected = []
+
+        class FakeClient:
+            """
+            Electrum client that records how it was asked to connect and goes no further.
+            """
+
+            def __init__(self, **kwargs: object) -> None:
+                pass
+
+            async def connect(self, server: object, **kwargs: object) -> None:
+                connected.append(dict(kwargs, protocols=server.protocols))
+                raise ConnectionError('Not connecting in a test')
+
+            def close(self) -> None:
+                pass
+
+        command = ['indy.py', BIP32_TEST_XPRIV] + (['--host', 'example.invalid'] if with_host else []) + flags
+        asyncio.set_event_loop(None)
+
+        with mock.patch.object(indy, 'StratumClient', FakeClient), mock.patch.object(sys, 'argv', command):
+            with redirect_stdout(io.StringIO()):
+                try:
+                    indy.main()
+                except ConnectionError:
+                    pass
+
+        return connected[0] if connected else {}
 
 
 class TestEventLoop(unittest.TestCase):
@@ -573,6 +658,9 @@ class TestEventLoop(unittest.TestCase):
 
         command = ['indy.py', BIP32_TEST_XPRIV, '--host', 'example.invalid']
 
+        # Named rather than counted from the end, so that another argument does not slip past
+        allow_high_fee_at, assume_yes_at = 8, 9
+
         for flags, allow_high_fee, assume_yes in [([], False, False),
                                                   (['--yes'], False, True),
                                                   (['--allow-high-fee'], True, False),
@@ -585,7 +673,8 @@ class TestEventLoop(unittest.TestCase):
                 with redirect_stdout(io.StringIO()):
                     indy.main()
 
-            self.assertEqual(captured[0][-2:], (allow_high_fee, assume_yes), flags)
+            self.assertEqual(captured[0][allow_high_fee_at], allow_high_fee, flags)
+            self.assertEqual(captured[0][assume_yes_at], assume_yes, flags)
 
     def test_the_electrum_client_takes_the_loop_it_is_built_inside(self) -> None:
         # The client reaches for the running loop in its constructor, so it has to be built from

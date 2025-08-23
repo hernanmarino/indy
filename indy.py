@@ -79,8 +79,14 @@ def main():
                           help='electrum connection protocol: t=TCP, s=SSL (default: s)')
     electrum.add_argument('--no-batching', default=False, action='store_true',
                           help='disable request batching')
+    electrum.add_argument('--insecure', default=False, action='store_true',
+                          help='connect without verifying the server certificate, and allow plain TCP')
 
     args = parser.parse_args()
+
+    if args.protocol == 't' and not args.insecure:
+        parser.error('plain TCP puts every address this scans on the wire in the clear; '
+                     'pass --insecure if that is what you want')
 
     key = _read_key(args.key)
     passphrase = _read_passphrase(args.passphrase, args.ask_passphrase)
@@ -104,7 +110,8 @@ def main():
         args.broadcast,
         not args.no_batching,
         args.allow_high_fee,
-        args.yes
+        args.yes,
+        args.insecure
     ))
 
 
@@ -255,15 +262,21 @@ async def find_utxos(
         should_broadcast: bool,
         should_batch: bool,
         allow_high_fee: bool = False,
-        assume_yes: bool = False
+        assume_yes: bool = False,
+        insecure: bool = False
 ):
     """
     Connect to an electrum server and find all the UTXOs spendable by a master key.
     """
+    if not insecure and server.protocols != {'s'}:
+        print('⛔️  That server would be reached over plain TCP, putting every address this looks up')
+        print('    on the wire in the clear. Pass `--insecure` if that is what you want')
+        return
+
     print('⏳  Connecting to electrum server, this might take a while')
 
     client = StratumClient(my_proto_version=ELECTRUM_PROTOCOL_VERSIONS)
-    await client.connect(server, disable_cert_verify=True)
+    await client.connect(server, disable_cert_verify=insecure)
 
     print('🌍  Connected to electrum server successfully')
 
