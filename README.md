@@ -46,7 +46,7 @@ usage: indy.py [-h] [--passphrase <pass> | --ask-passphrase]
                [--allow-invalid-checksum] [--address <address>] [--broadcast]
                [--fee-rate <rate>] [--allow-high-fee] [--yes]
                [--address-gap <num>] [--account-gap <num>] [--host <host>]
-               [--port <port>] [--protocol {t,s}] [--no-batching]
+               [--port <port>] [--protocol {t,s}] [--no-batching] [--insecure]
                [key]
 
 Find and sweep all the funds from a mnemonic or bitcoin key, regardless of the
@@ -83,6 +83,8 @@ electrum server:
   --protocol {t,s}      electrum connection protocol: t=TCP, s=SSL (default:
                         s)
   --no-batching         disable request batching
+  --insecure            connect without verifying the server certificate, and
+                        allow plain TCP
 ```
 
 ## Tests
