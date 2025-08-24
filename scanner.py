@@ -6,10 +6,15 @@ from connectrum.client import StratumClient
 from tqdm import tqdm
 
 import scripts
-from descriptors import ScriptIterator, Path
+from descriptors import Path, Script, ScriptIterator
 from scripts import ScriptType
 
 MAX_BATCH_SIZE = 100
+
+# Nothing a server says about an output is taken on faith: these are the shapes a real one has
+TXID_LENGTH_IN_BYTES = 32
+MAX_OUTPUT_INDEX = 0xffff_ffff
+MAX_MONEY_IN_SAT = 21_000_000 * 100_000_000
 
 
 class Utxo:
@@ -38,6 +43,8 @@ async def scan_master_key(
     batch_size = MAX_BATCH_SIZE if should_batch else 1
     script_iter = ScriptIterator(master_key, address_gap, account_gap)
     descriptors = set()
+    outpoints = set()
+    balance = 0
     utxos = []
 
     # TODO: parallelize fetching
@@ -68,6 +75,9 @@ async def scan_master_key(
             # Using the responses, compute the next batch of *used* scripts
             used_scripts = []
             for script, response in zip(scripts, responses):
+                if not isinstance(response, list):
+                    raise ValueError(f'The server answered with {response!r} where a history belongs')
+
                 if len(response) == 0:
                     continue
 
@@ -90,13 +100,31 @@ async def scan_master_key(
             responses = await _electrum_rpc(client, batch_request)
 
             for script, response in zip(used_scripts, responses):
-                for entry in response:
-                    txid, output_index, amount = entry['tx_hash'], entry['tx_pos'], entry['value']
+                if not isinstance(response, list):
+                    raise ValueError(f'The server answered with {response!r} where a list of outputs belongs')
 
-                    utxo = Utxo(txid, output_index, amount, script.full_path(), script.type())
+                for entry in response:
+                    utxo = _utxo_from(entry, script)
+
+                    if (utxo.txid, utxo.output_index) in outpoints:
+                        raise ValueError(f'The server offered ({utxo.txid}, {utxo.output_index}) twice')
+
+                    outpoints.add((utxo.txid, utxo.output_index))
+
+                    # An output worth nothing is valid by consensus and adds nothing to a sweep,
+                    # so it is passed over rather than allowed to stop the recovery
+                    if utxo.amount_in_sat == 0:
+                        continue
+
+                    balance += utxo.amount_in_sat
+
+                    if balance > MAX_MONEY_IN_SAT:
+                        raise ValueError(f'The server has offered more than {MAX_MONEY_IN_SAT} satoshis in all')
+
                     utxos.append(utxo)
 
-                    message = f'💰  Found unspent output at ({txid}, {output_index}) with {amount} sats'
+                    message = (f'💰  Found unspent output at ({utxo.txid}, {utxo.output_index}) '
+                               f'with {utxo.amount_in_sat} sats')
                     progress_bar.write(message)
 
             # Update the progress bar
@@ -105,6 +133,56 @@ async def scan_master_key(
             progress_bar.refresh()
 
     return utxos
+
+
+def _whole_number(value: object, field: str) -> int:
+    """
+    Read a field that has to be a whole number, refusing anything that only looks like one.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f'The server gave {value!r} as {field}, which is not a whole number')
+
+    return value
+
+
+def _utxo_from(entry: object, script: Script) -> Utxo:
+    """
+    Build an unspent output out of what a server said, or refuse what it said.
+    """
+    if not isinstance(entry, dict):
+        raise ValueError(f'The server answered with {entry!r} where an output belongs')
+
+    for field in ['tx_hash', 'tx_pos', 'value']:
+        if field not in entry:
+            raise ValueError(f'The server left {field} out of {entry!r}')
+
+    given_txid = entry['tx_hash']
+
+    if not isinstance(given_txid, str):
+        raise ValueError(f'The server gave {given_txid!r} as a transaction id')
+
+    try:
+        raw_txid = bytes.fromhex(given_txid)
+    except ValueError:
+        raise ValueError(f'The server gave {given_txid!r} as a transaction id')
+
+    if len(raw_txid) != TXID_LENGTH_IN_BYTES:
+        raise ValueError(f'The server gave {given_txid!r} as a transaction id')
+
+    # Written back out from the bytes, so that the same id cannot arrive twice in two spellings
+    txid = raw_txid.hex()
+
+    output_index = _whole_number(entry['tx_pos'], 'an output index')
+
+    if not 0 <= output_index <= MAX_OUTPUT_INDEX:
+        raise ValueError(f'The server gave {output_index} as an output index')
+
+    amount = _whole_number(entry['value'], 'an amount')
+
+    if not 0 <= amount <= MAX_MONEY_IN_SAT:
+        raise ValueError(f'The server gave {amount} as an amount in satoshis')
+
+    return Utxo(txid, output_index, amount, script.full_path(), script.type())
 
 
 def _electrum_script_hash(script: bytes) -> str:
@@ -129,4 +207,8 @@ async def _electrum_rpc(client: StratumClient, requests: List[Tuple[str, ...]]) 
         return [response]
 
     response = await client.batch_rpc(requests)
+
+    if not isinstance(response, list) or len(response) != len(requests):
+        raise ValueError(f'The server answered {len(requests)} requests with {response!r}')
+
     return response
