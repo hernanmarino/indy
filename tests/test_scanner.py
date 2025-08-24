@@ -14,6 +14,9 @@ from scripts import ScriptType
 # Master key from the BIP32 test vector 1
 BIP32_TEST_SEED = bytes.fromhex('000102030405060708090a0b0c0d0e0f')
 
+# Stands in for "answer as usual", so that None itself can be given as an answer
+UNCHANGED = object()
+
 # A path the catalogue explores early, so the scan finds it without walking far
 USED_PATH = "m/44'/0'/0'/0/0"
 USED_TYPE = ScriptType.LEGACY
@@ -35,17 +38,22 @@ class FakeClient:
     HISTORY = 'blockchain.scripthash.get_history'
     UNSPENT = 'blockchain.scripthash.listunspent'
 
-    def __init__(self, used_hashes: Set[str]) -> None:
+    def __init__(self, used_hashes: Set[str], unspent: object = UNCHANGED, short_batches: bool = False) -> None:
         self.used_hashes = used_hashes
+        self.unspent = unspent
+        self.short_batches = short_batches
+        self.history = [{'tx_hash': 'ab' * 32, 'height': 700_000}]
         self.closed = False
 
-    async def RPC(self, method: str, *params: Any) -> List:
+    async def RPC(self, method: str, *params: Any) -> object:
         return self._answer(method, params[0])
 
-    async def batch_rpc(self, requests: List[Tuple[str, ...]]) -> List:
-        return [self._answer(method, script_hash) for method, script_hash in requests]
+    async def batch_rpc(self, requests: List[Tuple[str, ...]]) -> object:
+        answers = [self._answer(method, script_hash) for method, script_hash in requests]
 
-    def _answer(self, method: str, script_hash: str) -> List:
+        return answers[:-1] if self.short_batches and answers else answers
+
+    def _answer(self, method: str, script_hash: str) -> object:
         if method not in [self.HISTORY, self.UNSPENT]:
             raise AssertionError(f'The scanner asked for an unknown method: {method}')
 
@@ -53,7 +61,10 @@ class FakeClient:
             return []
 
         if method == self.HISTORY:
-            return [{'tx_hash': 'ab' * 32, 'height': 700_000}]
+            return self.history
+
+        if self.unspent is not UNCHANGED:
+            return self.unspent
 
         return [{'tx_hash': 'ab' * 32, 'tx_pos': 0, 'value': 100_000}]
 
@@ -118,6 +129,112 @@ class TestScan(unittest.TestCase):
 
         with redirect_stdout(captured):
             self.assertEqual(asyncio.run(scan()), [])
+
+
+class TestServerAnswers(unittest.TestCase):
+    """
+    What the scan accepts from a server it has no reason to trust.
+    """
+
+    SOUND = {'tx_hash': 'ab' * 32, 'tx_pos': 0, 'value': 100_000}
+
+    def _scan_with(self, unspent: object, short_batches: bool = False) -> List[scanner.Utxo]:
+        master_key = BIP32.from_seed(BIP32_TEST_SEED)
+        client = FakeClient({_script_hash_of(master_key, USED_PATH, USED_TYPE)}, unspent, short_batches)
+
+        async def scan() -> List[scanner.Utxo]:
+            return await scanner.scan_master_key(client, master_key, 20, 0, True)
+
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            return asyncio.run(scan())
+
+    def test_a_sound_answer_is_accepted(self) -> None:
+        self.assertEqual(len(self._scan_with([self.SOUND])), 1)
+
+    def test_an_amount_that_is_not_a_whole_number_is_refused(self) -> None:
+        for value in [100_000.0, '100000', None, True, [100_000]]:
+            with self.assertRaises(ValueError, msg=repr(value)):
+                self._scan_with([dict(self.SOUND, value=value)])
+
+    def test_an_amount_outside_what_can_exist_is_refused(self) -> None:
+        for value in [-1, scanner.MAX_MONEY_IN_SAT + 1]:
+            with self.assertRaises(ValueError, msg=repr(value)):
+                self._scan_with([dict(self.SOUND, value=value)])
+
+    def test_the_amounts_that_can_exist_are_accepted(self) -> None:
+        for value in [1, scanner.MAX_MONEY_IN_SAT]:
+            self.assertEqual(len(self._scan_with([dict(self.SOUND, value=value)])), 1, repr(value))
+
+    def test_the_last_possible_output_index_is_accepted(self) -> None:
+        self.assertEqual(len(self._scan_with([dict(self.SOUND, tx_pos=scanner.MAX_OUTPUT_INDEX)])), 1)
+
+    def test_an_output_worth_nothing_is_passed_over_rather_than_fatal(self) -> None:
+        # Valid by consensus and worth nothing to a sweep, so it must not sink the whole recovery
+        found = self._scan_with([dict(self.SOUND, value=0),
+                                 dict(self.SOUND, tx_pos=1, value=50_000)])
+
+        self.assertEqual([utxo.amount_in_sat for utxo in found], [50_000])
+
+    def test_more_money_than_exists_in_total_is_refused(self) -> None:
+        # Each amount can be the whole supply; what cannot is their sum
+        outputs = [dict(self.SOUND, tx_pos=index, value=scanner.MAX_MONEY_IN_SAT) for index in range(3)]
+
+        with self.assertRaises(ValueError):
+            self._scan_with(outputs)
+
+    def test_one_transaction_id_spelled_two_ways_is_still_one_output(self) -> None:
+        # fromhex ignores case and whitespace, so two spellings serialize to the same outpoint
+        with self.assertRaises(ValueError):
+            self._scan_with([self.SOUND, dict(self.SOUND, tx_hash=('AB' * 32))])
+
+    def test_a_transaction_id_padded_to_the_right_length_is_refused(self) -> None:
+        # Sixty-four characters, but only thirty-one bytes once the spaces are dropped
+        with self.assertRaises(ValueError):
+            self._scan_with([dict(self.SOUND, tx_hash='ab' * 31 + '  ')])
+
+    def test_a_history_that_is_not_a_list_is_refused(self) -> None:
+        master_key = BIP32.from_seed(BIP32_TEST_SEED)
+        client = FakeClient({_script_hash_of(master_key, USED_PATH, USED_TYPE)})
+        client.history = {'not': 'a list'}
+
+        async def scan() -> List[scanner.Utxo]:
+            return await scanner.scan_master_key(client, master_key, 20, 0, True)
+
+        with self.assertRaises(ValueError):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                asyncio.run(scan())
+
+    def test_an_output_index_that_makes_no_sense_is_refused(self) -> None:
+        for tx_pos in [-1, 1.5, '0', None, True, 0x1_0000_0000]:
+            with self.assertRaises(ValueError, msg=repr(tx_pos)):
+                self._scan_with([dict(self.SOUND, tx_pos=tx_pos)])
+
+    def test_a_transaction_id_that_is_not_one_is_refused(self) -> None:
+        for txid in ['ab' * 31, 'ab' * 33, 'zz' * 32, '', None, 42]:
+            with self.assertRaises(ValueError, msg=repr(txid)):
+                self._scan_with([dict(self.SOUND, tx_hash=txid)])
+
+    def test_an_answer_that_is_not_a_list_of_entries_is_refused(self) -> None:
+        for unspent in [{'tx_hash': 'ab' * 32}, 'unspent', 42, None, [None], ['not an entry']]:
+            with self.assertRaises(ValueError, msg=repr(unspent)):
+                self._scan_with(unspent)
+
+    def test_a_missing_field_is_refused(self) -> None:
+        for missing in ['tx_hash', 'tx_pos', 'value']:
+            entry = {field: value for field, value in self.SOUND.items() if field != missing}
+
+            with self.assertRaises(ValueError, msg=missing):
+                self._scan_with([entry])
+
+    def test_the_same_output_offered_twice_is_refused_rather_than_quietly_dropped(self) -> None:
+        # Spending one output twice builds a transaction the network rejects, and counting it
+        # twice inflates the balance; neither is something to paper over by picking one
+        with self.assertRaises(ValueError):
+            self._scan_with([self.SOUND, dict(self.SOUND)])
+
+    def test_a_batch_answered_short_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self._scan_with([self.SOUND], short_batches=True)
 
 
 if __name__ == '__main__':
