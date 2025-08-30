@@ -6,6 +6,7 @@ from connectrum.client import StratumClient
 from tqdm import tqdm
 
 import scripts
+import transactions
 from descriptors import Path, Script, ScriptIterator
 from scripts import ScriptType
 
@@ -99,6 +100,8 @@ async def scan_master_key(
 
             responses = await _electrum_rpc(client, batch_request)
 
+            found_here = []
+
             for script, response in zip(used_scripts, responses):
                 if not isinstance(response, list):
                     raise ValueError(f'The server answered with {response!r} where a list of outputs belongs')
@@ -121,11 +124,27 @@ async def scan_master_key(
                     if balance > MAX_MONEY_IN_SAT:
                         raise ValueError(f'The server has offered more than {MAX_MONEY_IN_SAT} satoshis in all')
 
-                    utxos.append(utxo)
+                    found_here.append((utxo, script.program))
 
-                    message = (f'💰  Found unspent output at ({utxo.txid}, {utxo.output_index}) '
-                               f'with {utxo.amount_in_sat} sats')
-                    progress_bar.write(message)
+            # What the server says an output holds is only worth as much as the transaction it
+            # comes from, which it also serves, so each one is read back and checked against it.
+            # One request per transaction rather than per output, in batches of the same size as
+            # the rest, so that a round with many findings does not turn into one huge request
+            wanted = sorted({utxo.txid for utxo, _ in found_here})
+            transaction_of = {}
+
+            for at in range(0, len(wanted), batch_size):
+                asked_for = wanted[at:at + batch_size]
+                batch_request = [('blockchain.transaction.get', txid) for txid in asked_for]
+                transaction_of.update(zip(asked_for, await _electrum_rpc(client, batch_request)))
+
+            for utxo, program in found_here:
+                _check_against_its_transaction(utxo, program, transaction_of[utxo.txid])
+                utxos.append(utxo)
+
+                message = (f'💰  Found unspent output at ({utxo.txid}, {utxo.output_index}) '
+                           f'with {utxo.amount_in_sat} sats')
+                progress_bar.write(message)
 
             # Update the progress bar
             progress_bar.total = script_iter.total_scripts()
@@ -133,6 +152,38 @@ async def scan_master_key(
             progress_bar.refresh()
 
     return utxos
+
+
+def _check_against_its_transaction(utxo: Utxo, program: bytes, raw: object) -> None:
+    """
+    Check an output against the transaction that holds it, refusing anything that disagrees.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(f'The server answered with {raw!r} where the transaction of {utxo.txid} belongs')
+
+    try:
+        transaction = bytes.fromhex(raw)
+    except ValueError:
+        raise ValueError(f'The server answered with {raw!r} where the transaction of {utxo.txid} belongs')
+
+    txid, outputs = transactions.read_transaction(transaction)
+
+    # Recomputed rather than taken on trust: otherwise a server can serve any transaction that
+    # happens to agree with what it claimed
+    if txid != utxo.txid:
+        raise ValueError(f'The server answered with the transaction {txid} where {utxo.txid} belongs')
+
+    if utxo.output_index >= len(outputs):
+        raise ValueError(f'The transaction {txid} has no output {utxo.output_index}')
+
+    amount, script = outputs[utxo.output_index]
+
+    if amount != utxo.amount_in_sat:
+        raise ValueError(f'The server said output {utxo.output_index} of {txid} holds '
+                         f'{utxo.amount_in_sat} satoshis, and it holds {amount}')
+
+    if script != program:
+        raise ValueError(f'Output {utxo.output_index} of {txid} does not pay the address it was found at')
 
 
 def _whole_number(value: object, field: str) -> int:

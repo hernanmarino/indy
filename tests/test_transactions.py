@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import hashlib
 import math
 import unittest
 from typing import List, Tuple
@@ -93,6 +94,13 @@ SEGWIT_RAW = (
 )
 
 
+def _reversed_double_sha256(raw: bytes) -> str:
+    """
+    Hash a transaction the way an id is taken, independently of how the reader does it.
+    """
+    return hashlib.sha256(hashlib.sha256(raw).digest()).digest()[::-1].hex()
+
+
 class TestReadingTransactions(unittest.TestCase):
     """
     Reading a serialized transaction back, to check what a server says about its outputs.
@@ -129,6 +137,44 @@ class TestReadingTransactions(unittest.TestCase):
         for cut in [0, 4, 10, 60, len(LEGACY_RAW) // 2 - 1]:
             with self.assertRaises(ValueError, msg=cut):
                 transactions.read_transaction(bytes.fromhex(LEGACY_RAW)[:cut])
+
+    def test_a_transaction_of_any_version_and_locktime_is_read(self) -> None:
+        # Both fixtures from the chain are version 1 with no locktime, which leaves those fields
+        # riding on nothing: a reader that ignored them would agree on every test above
+        raw = bytearray((2).to_bytes(4, 'little'))
+        raw += b'\x01' + b'\xaa' * 32 + (0).to_bytes(4, 'little') + b'\x00' + b'\xff' * 4
+        raw += b'\x01' + (1_000).to_bytes(8, 'little') + b'\x01\x51'
+        raw += (800_000).to_bytes(4, 'little')
+
+        txid, outputs = transactions.read_transaction(bytes(raw))
+
+        self.assertEqual(txid, _reversed_double_sha256(bytes(raw)))
+        self.assertEqual(outputs, [(1_000, b'\x51')])
+
+    def test_counts_that_need_more_than_one_byte_are_read(self) -> None:
+        # Neither fixture has a count over 252, so the wider CompactSize encodings ride on nothing
+        raw = bytearray((1).to_bytes(4, 'little'))
+        raw += b'\x01' + b'\xaa' * 32 + (0).to_bytes(4, 'little') + b'\x00' + b'\xff' * 4
+        raw += b'\xfd' + (300).to_bytes(2, 'little')
+        raw += b''.join((index + 1).to_bytes(8, 'little') + b'\x01\x51' for index in range(300))
+        raw += (0).to_bytes(4, 'little')
+
+        txid, outputs = transactions.read_transaction(bytes(raw))
+
+        self.assertEqual(txid, _reversed_double_sha256(bytes(raw)))
+        self.assertEqual(len(outputs), 300)
+        self.assertEqual(outputs[299], (300, b'\x51'))
+
+    def test_a_script_longer_than_a_single_byte_count_is_read(self) -> None:
+        script = b'\x51' * 300
+        raw = bytearray((1).to_bytes(4, 'little'))
+        raw += b'\x01' + b'\xaa' * 32 + (0).to_bytes(4, 'little') + b'\x00' + b'\xff' * 4
+        raw += b'\x01' + (1_000).to_bytes(8, 'little') + b'\xfd' + (300).to_bytes(2, 'little') + script
+        raw += (0).to_bytes(4, 'little')
+
+        _, outputs = transactions.read_transaction(bytes(raw))
+
+        self.assertEqual(outputs, [(1_000, script)])
 
     def test_something_that_is_no_transaction_is_refused(self) -> None:
         with self.assertRaises(ValueError):
