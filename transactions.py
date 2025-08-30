@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 from typing import List, Tuple
 
 import coincurve
@@ -86,6 +88,119 @@ class Transaction:
         format for non-witness transactions.
         """
         return _serialize_tx(self.inputs, self.outputs)
+
+
+def read_transaction(raw: bytes) -> Tuple[str, List[Tuple[int, bytes]]]:
+    """
+    Read a serialized transaction, returning the id it is known by and its outputs.
+    """
+    reader = _Reader(raw)
+
+    version = reader.take(4)
+    inputs, witness_flag = _read_inputs(reader)
+    outputs = _read_outputs(reader)
+
+    if witness_flag:
+        for _ in inputs:
+            for _ in range(reader.varint()):
+                reader.take(reader.varint())
+
+    locktime = reader.take(4)
+    reader.done()
+
+    # An id never covers the witness, so it is taken over the transaction without one
+    without_witness = bytearray(version)
+    without_witness.extend(_varint(len(inputs)))
+
+    for outpoint, script, sequence in inputs:
+        without_witness.extend(outpoint)
+        without_witness.extend(_varint(len(script)))
+        without_witness.extend(script)
+        without_witness.extend(sequence)
+
+    without_witness.extend(_varint(len(outputs)))
+
+    for amount, script in outputs:
+        without_witness.extend(amount.to_bytes(8, 'little'))
+        without_witness.extend(_varint(len(script)))
+        without_witness.extend(script)
+
+    without_witness.extend(locktime)
+
+    return _reversed(scripts.sha256(scripts.sha256(bytes(without_witness)))).hex(), outputs
+
+
+def _read_inputs(reader: '_Reader') -> Tuple[List[Tuple[bytes, bytes, bytes]], bool]:
+    """
+    Read the inputs, taking the segwit marker out of the way if it is there.
+    """
+    count = reader.varint()
+    witness_flag = False
+
+    if count == 0:
+        if reader.take(1) != b'\x01':
+            raise ValueError('A transaction with no inputs has no segwit flag either')
+
+        witness_flag = True
+        count = reader.varint()
+
+    if count == 0:
+        raise ValueError('A transaction with no inputs is not one')
+
+    inputs = []
+
+    for _ in range(count):
+        outpoint = reader.take(36)
+        script = reader.take(reader.varint())
+        inputs.append((outpoint, script, reader.take(4)))
+
+    return inputs, witness_flag
+
+
+def _read_outputs(reader: '_Reader') -> List[Tuple[int, bytes]]:
+    """
+    Read the outputs, each an amount and the script that locks it.
+    """
+    count = reader.varint()
+
+    if count == 0:
+        raise ValueError('A transaction with no outputs is not one')
+
+    return [(int.from_bytes(reader.take(8), 'little'), reader.take(reader.varint()))
+            for _ in range(count)]
+
+
+class _Reader:
+    """
+    Walks over a serialized transaction, refusing to read past what is there.
+    """
+
+    def __init__(self, raw: bytes) -> None:
+        self.raw = raw
+        self.at = 0
+
+    def take(self, count: int) -> bytes:
+        if count < 0 or self.at + count > len(self.raw):
+            raise ValueError(f'The transaction ends before the {count} bytes expected at {self.at}')
+
+        taken = self.raw[self.at:self.at + count]
+        self.at += count
+
+        return taken
+
+    def varint(self) -> int:
+        marker = self.take(1)[0]
+
+        if marker < 0xfd:
+            return marker
+
+        widths = {0xfd: 2, 0xfe: 4, 0xff: 8}
+
+        return int.from_bytes(self.take(widths[marker]), 'little')
+
+    def done(self) -> None:
+        if self.at != len(self.raw):
+            raise ValueError(f'The transaction ends at {self.at} with {len(self.raw) - self.at} bytes to spare')
 
 
 def _serialize_tx(
