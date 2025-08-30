@@ -71,6 +71,70 @@ def _signature_and_pubkey(tx: transactions.Transaction, index: int) -> Tuple[byt
     return witness[0], witness[1]
 
 
+# Two transactions from the chain, with the ids they are known by. The segwit one is the test
+# that matters: an id never covers the witness, so a reader that keeps it computes another id
+LEGACY_TXID = 'f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16'
+LEGACY_RAW = (
+    '0100000001c997a5e56e104102fa209c6a852dd90660a20b2d9c352423edce25857fcd3704000000004847304402204e45e1'
+    '6932b8af514961a1d3a1a25fdf3f4f7732e9d624c6c61548ab5fb8cd410220181522ec8eca07de4860a4acdd12909d831cc5'
+    '6cbbac4622082221a8768d1d0901ffffffff0200ca9a3b00000000434104ae1a62fe09c5f51b13905f07f06b99a2f7159b22'
+    '25f374cd378d71302fa28414e7aab37397f554a7df5f142c21c1b7303b8a0626f1baded5c72a704f7e6cd84cac00286bee00'
+    '00000043410411db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f8'
+    '2e160bfa9b8b64f9d4c03f999b8643f656b412a3ac00000000'
+)
+
+SEGWIT_TXID = '0aa80eddc9a0af25709dae5db5f270ac39a9ecf210c2a0bed5b1f9a70c8b0fa5'
+SEGWIT_RAW = (
+    '01000000000101df11a710eeacd2de1d2d7b14ff78bfc28d519ab28328281426a14b47deb3233c0000000000ffffff000280'
+    '38010000000000160014c0cebcd6c3d3ca8c75dc5ec62ebe55330ef910e2f24401000000000016001432bd79747bf33eb54b'
+    'a72e00ef0a32b079c5cf7e024830450221009c52cab824dad09f5a6681e36387388e957cbb557594428dc27de06fb794b7f7'
+    '02205d0f6a7e6c50ca4883063308cdcfa6f027365d927c6943bf019f3868ed7383710121030863e3f0c53d48e3f005a13820'
+    '34da9c78710dc46c5288dcdd6019943557277d00000000'
+)
+
+
+class TestReadingTransactions(unittest.TestCase):
+    """
+    Reading a serialized transaction back, to check what a server says about its outputs.
+    """
+
+    def test_a_legacy_transaction_is_read_back_to_its_id(self) -> None:
+        txid, _ = transactions.read_transaction(bytes.fromhex(LEGACY_RAW))
+
+        self.assertEqual(txid, LEGACY_TXID)
+
+    def test_a_segwit_transaction_is_read_back_to_its_id(self) -> None:
+        # The witness is not part of what an id covers, so it has to be dropped to arrive at one
+        txid, _ = transactions.read_transaction(bytes.fromhex(SEGWIT_RAW))
+
+        self.assertEqual(txid, SEGWIT_TXID)
+
+    def test_the_outputs_of_a_legacy_transaction_are_read(self) -> None:
+        _, outputs = transactions.read_transaction(bytes.fromhex(LEGACY_RAW))
+
+        self.assertEqual([amount for amount, _ in outputs], [1_000_000_000, 4_000_000_000])
+        self.assertTrue(all(script.endswith(b'\xac') for _, script in outputs))
+
+    def test_the_outputs_of_a_segwit_transaction_are_read(self) -> None:
+        _, outputs = transactions.read_transaction(bytes.fromhex(SEGWIT_RAW))
+
+        self.assertEqual([amount for amount, _ in outputs], [80_000, 83_186])
+        self.assertTrue(all(script.startswith(b'\x00\x14') for _, script in outputs))
+
+    def test_trailing_bytes_are_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            transactions.read_transaction(bytes.fromhex(LEGACY_RAW) + b'\x00')
+
+    def test_a_transaction_cut_short_is_refused(self) -> None:
+        for cut in [0, 4, 10, 60, len(LEGACY_RAW) // 2 - 1]:
+            with self.assertRaises(ValueError, msg=cut):
+                transactions.read_transaction(bytes.fromhex(LEGACY_RAW)[:cut])
+
+    def test_something_that_is_no_transaction_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            transactions.read_transaction(b'\xff' * 40)
+
+
 class TestVarint(unittest.TestCase):
     """
     CompactSize encoding, over the four ranges defined by the wire format.
