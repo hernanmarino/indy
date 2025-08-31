@@ -163,6 +163,18 @@ class TestOutputScriptFromAddress(unittest.TestCase):
     def test_rejects_a_bech32_address_from_another_network(self) -> None:
         self.assertIsNone(scripts.build_output_script_from_address('tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx'))
 
+    def test_rejects_a_base58_string_that_carries_nothing_at_all(self) -> None:
+        # Its checksum adds up over an empty payload, so there is not even a header to read
+        self.assertIsNone(scripts.build_output_script_from_address('3QJmnh'))
+
+    def test_rejects_a_base58_address_carrying_a_hash_of_the_wrong_length(self) -> None:
+        # A script built around this one would compare a 20 byte hash against a single byte
+        self.assertIsNone(scripts.build_output_script_from_address('18AV53K'))
+
+    def test_rejects_a_base58_address_carrying_one_byte_too_many(self) -> None:
+        # Base58Check over a 21 byte hash: everything about it adds up except what it carries
+        self.assertIsNone(scripts.build_output_script_from_address('17sJVfvMWz5aMVTuwpRkaD97VcGzqH2pF78'))
+
     def test_rejects_an_unrecognized_string(self) -> None:
         self.assertIsNone(scripts.build_output_script_from_address('not an address'))
 

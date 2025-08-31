@@ -16,6 +16,7 @@ OP_CHECKSIG = 0xac
 
 P2PKH_ADDRESS_HEADER = 0x00
 P2SH_ADDRESS_HEADER = 0x05
+BASE58_ADDRESS_LENGTH_IN_BYTES = 21
 BECH32_HRP = 'bc'
 BECH32_SEPARATOR = '1'
 
@@ -101,14 +102,16 @@ def build_output_script_from_address(address: str) -> Optional[bytes]:
     # Try to decode a base58 address
     try:
         decoded = base58.b58decode_check(address)
-        version = decoded[0]
-        hash = decoded[1:]
 
-        if version == P2PKH_ADDRESS_HEADER:
-            return _build_p2pkh_output_script(hash)
+        if len(decoded) == BASE58_ADDRESS_LENGTH_IN_BYTES:
+            version = decoded[0]
+            hash = decoded[1:]
 
-        if version == P2SH_ADDRESS_HEADER:
-            return _build_p2sh_output_script(hash)
+            if version == P2PKH_ADDRESS_HEADER:
+                return _build_p2pkh_output_script(hash)
+
+            if version == P2SH_ADDRESS_HEADER:
+                return _build_p2sh_output_script(hash)
 
     except ValueError:
         pass
