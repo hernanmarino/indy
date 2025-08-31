@@ -25,6 +25,45 @@ BIP173_P2WPKH_SCRIPT = bytes.fromhex('0014751e76e8199196d454941c45d1b3a323f1433b
 BIP173_P2WSH_ADDRESS = 'bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3'
 BIP173_P2WSH_SCRIPT = bytes.fromhex('00201863143c14c5166804bd19203356da136c985678cd4d27a1b8c6329604903262')
 
+# The BIP350 vector that a wallet would really hand out today: a version 1, 32 byte program
+BIP350_V1_ADDRESS = 'bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0'
+
+
+# Mainnet addresses and their output scripts from the BIP350 test vectors
+BIP350_VALID_ADDRESSES = [
+    ('BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4', '0014751e76e8199196d454941c45d1b3a323f1433bd6'),
+    ('bc1pw508d6qejxtdg4y5r3zarvary0c5xw7kw508d6qejxtdg4y5r3zarvary0c5xw7kt5nd6y',
+     '5128751e76e8199196d454941c45d1b3a323f1433bd6751e76e8199196d454941c45d1b3a323f1433bd6'),
+    ('BC1SW50QGDZ25J', '6002751e'),
+    ('bc1zw508d6qejxtdg4y5r3zarvaryvaxxpcs', '5210751e76e8199196d454941c45d1b3a323'),
+    ('bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0',
+     '512079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798'),
+]
+
+# Mainnet addresses that BIP350 lists as invalid, each with the rule that turns it down
+BIP350_INVALID_ADDRESSES = [
+    ('bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqh2y7hd',
+     'bech32 checksum on a version 1 address'),
+    ('BC1S0XLXVLHEMJA6C4DQV22UAPCTQUPFHLXM9H8Z3K2E72Q4K9HCZ7VQ54WELL',
+     'bech32 checksum on a version 16 address'),
+    ('bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kemeawh',
+     'bech32m checksum on a version 0 address'),
+    ('bc1p38j9r5y49hruaue7wxjce0updqjuyyx0kh56v8s25huc6995vvpql3jow4',
+     'a character outside the charset in the checksum'),
+    ('BC130XLXVLHEMJA6C4DQV22UAPCTQUPFHLXM9H8Z3K2E72Q4K9HCZ7VQ7ZWS8R',
+     'a witness version above 16'),
+    ('bc1pw5dgrnzv',
+     'a witness program of a single byte'),
+    ('bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7v8n0nx0muaewav253zgeav',
+     'a witness program of 41 bytes'),
+    ('BC1QR508D6QEJXTDG4Y5R3ZARVARYV98GJ9P',
+     'a witness program length that version 0 does not allow'),
+    ('bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7v07qwwzcrf',
+     'zero padding of more than four bits'),
+    ('bc1gmk9yu',
+     'no data at all beyond the checksum'),
+]
+
 
 class TestHashHelpers(unittest.TestCase):
     """
@@ -124,8 +163,75 @@ class TestOutputScriptFromAddress(unittest.TestCase):
     def test_rejects_a_bech32_address_from_another_network(self) -> None:
         self.assertIsNone(scripts.build_output_script_from_address('tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx'))
 
+    def test_rejects_a_base58_string_that_carries_nothing_at_all(self) -> None:
+        # Its checksum adds up over an empty payload, so there is not even a header to read
+        self.assertIsNone(scripts.build_output_script_from_address('3QJmnh'))
+
+    def test_rejects_a_base58_address_carrying_a_hash_of_the_wrong_length(self) -> None:
+        # A script built around this one would compare a 20 byte hash against a single byte
+        self.assertIsNone(scripts.build_output_script_from_address('18AV53K'))
+
+    def test_rejects_a_base58_address_carrying_one_byte_too_many(self) -> None:
+        # Base58Check over a 21 byte hash: everything about it adds up except what it carries
+        self.assertIsNone(scripts.build_output_script_from_address('17sJVfvMWz5aMVTuwpRkaD97VcGzqH2pF78'))
+
     def test_rejects_an_unrecognized_string(self) -> None:
         self.assertIsNone(scripts.build_output_script_from_address('not an address'))
+
+
+class TestSegwitAddresses(unittest.TestCase):
+    """
+    Output scripts built from the segwit addresses of the BIP350 test vectors.
+    """
+
+    def test_every_valid_vector_builds_the_script_it_publishes(self) -> None:
+        for address, script in BIP350_VALID_ADDRESSES:
+            with self.subTest(address=address):
+                self.assertEqual(scripts.build_output_script_from_address(address), bytes.fromhex(script))
+
+    def test_every_invalid_vector_is_turned_down(self) -> None:
+        for address, reason in BIP350_INVALID_ADDRESSES:
+            with self.subTest(reason=reason):
+                self.assertIsNone(scripts.build_output_script_from_address(address))
+
+    def test_a_version_1_address_spends_to_the_version_1_opcode(self) -> None:
+        script = scripts.build_output_script_from_address(BIP350_V1_ADDRESS)
+
+        self.assertIsNotNone(script)
+        self.assertEqual(script[0], 0x51)
+
+    def test_the_witness_program_is_pushed_whole(self) -> None:
+        script = scripts.build_output_script_from_address(BIP350_V1_ADDRESS)
+
+        self.assertEqual(script[1], 32)
+        self.assertEqual(len(script), 34)
+
+    def test_a_version_1_address_from_another_network_is_turned_down(self) -> None:
+        testnet = 'tb1pqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvsesf3hn0c'
+
+        self.assertIsNone(scripts.build_output_script_from_address(testnet))
+
+    def test_an_address_in_mixed_case_is_turned_down(self) -> None:
+        mixed = BIP350_V1_ADDRESS[:4] + BIP350_V1_ADDRESS[4:].upper()
+
+        self.assertIsNone(scripts.build_output_script_from_address(mixed))
+
+    def test_an_address_whose_prefix_only_ends_in_the_mainnet_one_is_turned_down(self) -> None:
+        self.assertIsNone(scripts.build_output_script_from_address('a' + BIP350_V1_ADDRESS))
+
+    def test_a_prefix_with_nothing_behind_it_is_turned_down(self) -> None:
+        self.assertIsNone(scripts.build_output_script_from_address('bc1'))
+
+    def test_a_character_from_outside_bech32_that_folds_into_it_is_turned_down(self) -> None:
+        # The Kelvin sign lowercases to a plain k, which would otherwise read as a valid address
+        kelvin = BIP173_P2WPKH_ADDRESS.upper().replace('K', '\u212a', 1)
+
+        self.assertNotEqual(kelvin, BIP173_P2WPKH_ADDRESS.upper())
+        self.assertIsNone(scripts.build_output_script_from_address(kelvin))
+
+    def test_another_prefix_carrying_mainnet_data_is_turned_down(self) -> None:
+        # The checksum of this one only adds up when it is read as the mainnet address it was cut from
+        self.assertIsNone(scripts.build_output_script_from_address('xy1' + BIP350_V1_ADDRESS[3:]))
 
 
 if __name__ == '__main__':

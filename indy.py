@@ -16,6 +16,7 @@ from connectrum.svr_info import ServerInfo
 from mnemonic import Mnemonic
 
 import scanner
+import scripts
 import transactions
 
 # Offered to the server as a range, since not every server speaks the newest protocol
@@ -87,6 +88,9 @@ def main():
     if args.protocol == 't' and not args.insecure:
         parser.error('plain TCP puts every address this scans on the wire in the clear; '
                      'pass --insecure if that is what you want')
+
+    if args.address is not None and scripts.build_output_script_from_address(args.address) is None:
+        parser.error('the destination address is invalid or its format isn\'t recognized')
 
     key = _read_key(args.key)
     passphrase = _read_passphrase(args.passphrase, args.ask_passphrase)
