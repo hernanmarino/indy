@@ -263,6 +263,80 @@ class TestSecretInput(unittest.TestCase):
         self.assertIn('history', output)
 
 
+class TestDestinationAddress(unittest.TestCase):
+    """
+    When the destination address is looked at, and what a bad one costs.
+    """
+
+    # Some of the strings a sweep cannot be paid to
+    UNPAYABLE_ADDRESSES = ['bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kemeawh',
+                 'bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqh2y7hd',
+                 '18AV53K',
+                 '3QJmnh',
+                 'tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx',
+                 'not an address']
+
+    BECH32M = 'bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0'
+
+    def _run(self, address: Optional[str], key: Optional[str] = BIP32_TEST_XPRIV) -> None:
+        """
+        Run main with a destination address, recording whether anything was asked or scanned.
+        """
+        self.reached: List[object] = []
+        self.prompts: List[str] = []
+
+        async def find_utxos(*args: object) -> None:
+            self.reached.append(args)
+
+        def hidden(prompt: str = '') -> str:
+            self.prompts.append(prompt)
+            return BIP32_TEST_XPRIV
+
+        argv = ['indy.py', '--host', 'example.invalid']
+        argv += [key] if key is not None else []
+        argv += ['--address', address] if address is not None else []
+
+        with mock.patch.object(indy, 'find_utxos', find_utxos), \
+             mock.patch.object(getpass, 'getpass', hidden), \
+             mock.patch.object(sys, 'argv', argv):
+            with redirect_stdout(io.StringIO()):
+                indy.main()
+
+    def test_an_address_that_cannot_be_paid_stops_the_run_before_it_scans(self) -> None:
+        for address in self.UNPAYABLE_ADDRESSES:
+            with self.subTest(address=address):
+                with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+                    self._run(address)
+
+                self.assertEqual(self.reached, [])
+
+    def test_the_refusal_says_what_was_wrong(self) -> None:
+        errors = io.StringIO()
+
+        with self.assertRaises(SystemExit), redirect_stderr(errors):
+            self._run('not an address')
+
+        self.assertIn('address', errors.getvalue())
+
+    def test_nothing_secret_is_asked_for_an_address_that_cannot_be_paid(self) -> None:
+        for address in self.UNPAYABLE_ADDRESSES:
+            with self.subTest(address=address):
+                with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+                    self._run(address, key=None)
+
+                self.assertEqual(self.prompts, [])
+
+    def test_a_bech32m_address_is_a_destination_the_scan_runs_for(self) -> None:
+        self._run(self.BECH32M)
+
+        self.assertEqual(len(self.reached), 1)
+
+    def test_a_run_with_no_destination_at_all_still_scans(self) -> None:
+        self._run(None)
+
+        self.assertEqual(len(self.reached), 1)
+
+
 class TestFeeBounds(unittest.TestCase):
     """
     Limits on the fee a sweep is allowed to pay.
