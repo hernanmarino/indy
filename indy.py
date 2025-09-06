@@ -9,6 +9,8 @@ import random
 from decimal import Decimal
 from typing import List, Optional
 
+import base58
+import coincurve
 import connectrum
 from bip32 import BIP32
 from connectrum.client import StratumClient
@@ -24,6 +26,12 @@ ELECTRUM_PROTOCOL_VERSIONS = ['1.4', '1.4.2']
 
 SATOSHIS_PER_BITCOIN = 10 ** 8
 BYTES_PER_KILOBYTE = 1_000
+
+# An extended key carries its key data last: a private one marks it with a leading zero, and a
+# public one is the point itself, which is what the curve is asked about rather than the marker
+EXTENDED_KEY_LENGTH_IN_BYTES = 78
+KEY_DATA_STARTS_AT = 45
+PRIVATE_KEY_MARKER = 0x00
 
 # A rate outside these is refused whether a server quoted it or it was given by hand, and the fee
 # itself may not take more than this share of the funds found. A server picks the rate, so without
@@ -174,11 +182,9 @@ def _is_public_key(key: str) -> bool:
     """
     Whether this is an extended public key, the one input that is not worth hiding.
     """
-    try:
-        BIP32.from_xpub(key)
-        return True
-    except Exception:
-        return False
+    key_data = _key_data(key)
+
+    return key_data is not None and _is_a_point(key_data)
 
 
 def _read_key(given: Optional[str]) -> str:
@@ -216,23 +222,60 @@ def _checksum_matches(words: str) -> bool:
     return any(Mnemonic(language).check(words) for language in Mnemonic.list_languages())
 
 
+def _key_data(key: str) -> Optional[bytes]:
+    """
+    The key data an extended key carries, or nothing if the string is no extended key at all.
+    """
+    try:
+        decoded = base58.b58decode_check(key)
+    except Exception:
+        return None
+
+    if len(decoded) != EXTENDED_KEY_LENGTH_IN_BYTES:
+        return None
+
+    return decoded[KEY_DATA_STARTS_AT:]
+
+
+def _is_a_point(key_data: bytes) -> bool:
+    """
+    Whether key data stands for a point on the curve, which the marker it begins with can't say.
+    """
+    try:
+        coincurve.PublicKey(key_data)
+        return True
+    except Exception:
+        return False
+
+
+def _is_private_key(key: str) -> bool:
+    """
+    Whether this is an extended private key, told apart by the marker its key data begins with.
+    """
+    key_data = _key_data(key)
+
+    return key_data is not None and key_data[0] == PRIVATE_KEY_MARKER
+
+
 def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False) -> BIP32:
     """
     Try to parse an extended key, whether it is in xpub, xpriv or mnemonic format.
     """
-    try:
-        private_key = BIP32.from_xpriv(key)
-        print('🔑  Read master private key successfully')
-        return private_key
-    except Exception:
-        pass
+    if _is_private_key(key):
+        try:
+            private_key = BIP32.from_xpriv(key)
+            print('🔑  Read master private key successfully')
+            return private_key
+        except Exception:
+            pass
 
-    try:
-        public_key = BIP32.from_xpub(key)
-        print('🔑  Read master public key successfully')
-        return public_key
-    except Exception:
-        pass
+    if _is_public_key(key):
+        try:
+            public_key = BIP32.from_xpub(key)
+            print('🔑  Read master public key successfully')
+            return public_key
+        except Exception:
+            pass
 
     try:
         language = Mnemonic.detect_language(key)
@@ -272,6 +315,11 @@ async def find_utxos(
     """
     Connect to an electrum server and find all the UTXOs spendable by a master key.
     """
+    if master_key.master_privkey is None:
+        print('⛔️  Every derivation path this knows of starts at a hardened level, and a public key')
+        print('    cannot derive those. Recovering from an xpub needs the private key for now')
+        return
+
     if not insecure and server.protocols != {'s'}:
         print('⛔️  That server would be reached over plain TCP, putting every address this looks up')
         print('    on the wire in the clear. Pass `--insecure` if that is what you want')
@@ -293,11 +341,6 @@ async def find_utxos(
 
     balance = sum([utxo.amount_in_sat for utxo in utxos])
     print(f'💸  Total spendable balance found: {balance} sats')
-
-    if master_key.master_privkey is None:
-        print('✍️  Re-run with a private key to create a sweep transaction')
-        client.close()
-        return
 
     if address is None:
         print('ℹ️   Re-run with `--address` to create a sweep transaction')
