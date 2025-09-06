@@ -26,6 +26,33 @@ from scripts import ScriptType
 BIP32_TEST_XPRIV = ('xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvv'
                     'NKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi')
 
+# The public key of that same vector, and the same private key under a SLIP-132 prefix
+BIP32_TEST_XPUB = ('xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ES'
+                   'FjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8')
+BIP32_TEST_ZPRV = ('zprvAWgYBBk7JR8GjzqSzmunMCS7dAbwpYTCs1YUMDXqduMA5JFHZ3iX5s2UkAR6v'
+                   'BdcCYYa1S5o1fVLrKsrnpCQ4WpUd6aVUWP1bS2Yy5DoaKv')
+BIP32_TEST_ZPUB = ('zpub6jftahH18ngZxUuv6oSniLNrBCSSE1B4EEU59bwTCEt8x6aS6b2mdfLxbS4QS'
+                   '53g85SWWP6wexqeer516433gYpZQoJie2tcMYdJ1SYYYAL')
+
+# That same public key with its key data marked 0x01 and 0xff, neither of which is a point parity
+BIP32_TEST_XPUB_MARKED_01 = ('xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gYxFk5'
+                             'nqmbwrSjnkQvUtYydeKpRyanfmc6qmeyusqpnVEF2j8DGn')
+BIP32_TEST_XPUB_MARKED_FF = ('xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2ghTzpt'
+                             'gqt41dxzAMZBiYMF5w2RQPyuXp1yBkzwxbYKEBjawGLZqf')
+
+# Base58Check strings spelled like key data without standing for a key: one 46 bytes long, and
+# one the right length whose x coordinate is past the order of the field
+SHORT_PAYLOAD = '111111111111111111111111111111111111111111111GPWnLU'
+OFF_CURVE_XPUB = ('xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ1hr9'
+                  'Rwbk95YadvBkQXxzHBSngB8ndpW6QH7zhhsXZ2jHrohi8A')
+
+# Base58Check over ten bytes: too short for the key data to start where an extended key has it
+TINY_PAYLOAD = '2fgFdLat59SRaKu9M1a'
+
+# The test vector with ten bytes stuck on the end: a real point sits where one is looked for
+PADDED_XPUB = ('EqvLcMFcyzsxd3n8vc3j14D5Hy2rqrhyHwqhPiWia1TPjEQQ4rWquydPDb2XkDSEebJHyT9N'
+               'DUExWFPV3vqKcG3UVi15aYm5nB7nm1LrrZqkuT6PkZaCd8maXNVkJ')
+
 # A server reached over TLS, as every server in the bundled list is
 TEST_SERVER = ServerInfo('example.invalid', hostname='example.invalid', ports='s50002')
 
@@ -149,6 +176,39 @@ class TestKeyParsing(unittest.TestCase):
     def test_an_extended_key_is_read_without_any_checksum_talk(self) -> None:
         self.assertIsNotNone(self._parse(BIP32_TEST_XPRIV))
 
+    def test_a_public_key_is_not_read_as_a_private_one(self) -> None:
+        # Its key data is a point, not a scalar, and taking one for the other invents a wallet
+        self.assertIsNone(self._parse(BIP32_TEST_XPUB).master_privkey)
+
+    def test_a_public_key_stands_for_the_key_it_was_exported_from(self) -> None:
+        public = self._parse(BIP32_TEST_XPUB)
+        private = self._parse(BIP32_TEST_XPRIV)
+
+        self.assertEqual(public.get_pubkey_from_path([0, 0]), private.get_pubkey_from_path([0, 0]))
+
+    def test_a_public_key_under_another_prefix_is_still_read_as_public(self) -> None:
+        under_slip132 = self._parse(BIP32_TEST_ZPUB)
+
+        self.assertIsNone(under_slip132.master_privkey)
+        self.assertEqual(under_slip132.get_pubkey_from_path([0, 0]),
+                         self._parse(BIP32_TEST_XPUB).get_pubkey_from_path([0, 0]))
+
+    def test_a_private_key_under_another_prefix_is_still_read_as_private(self) -> None:
+        # SLIP-132 only changes the version bytes, so what the key carries is what tells them apart
+        # A derived child stands for the whole key: the chaincode goes into it as much as the scalar
+        under_slip132 = self._parse(BIP32_TEST_ZPRV)
+
+        self.assertIsNotNone(under_slip132.master_privkey)
+        self.assertEqual(under_slip132.get_pubkey_from_path([0, 0]),
+                         self._parse(BIP32_TEST_XPRIV).get_pubkey_from_path([0, 0]))
+
+    def test_key_data_that_is_neither_private_nor_a_point_is_refused(self) -> None:
+        for key in [BIP32_TEST_XPUB_MARKED_01, BIP32_TEST_XPUB_MARKED_FF,
+                    OFF_CURVE_XPUB, SHORT_PAYLOAD, PADDED_XPUB, TINY_PAYLOAD]:
+            with self.subTest(key=key[-8:]):
+                with self.assertRaises(ValueError):
+                    self._parse(key)
+
     def test_something_that_is_no_kind_of_key_is_refused(self) -> None:
         with self.assertRaises(ValueError):
             self._parse('not a key at all')
@@ -205,6 +265,28 @@ class TestSecretInput(unittest.TestCase):
             indy._read_key('xpub-not-really-a-key')
 
         self.assertIn('history', output.getvalue())
+
+    def test_a_private_key_on_the_command_line_is_warned_about(self) -> None:
+        # The exemption is for public keys, and an extended private key is spelled much like one
+        for key in [BIP32_TEST_XPRIV, BIP32_TEST_ZPRV]:
+            with self.subTest(key=key[:4]):
+                output = io.StringIO()
+
+                with redirect_stdout(output):
+                    indy._read_key(key)
+
+                self.assertIn('history', output.getvalue())
+
+    def test_only_something_that_really_is_a_public_key_draws_no_warning(self) -> None:
+        # Spelling the marker of a point is not standing for one, and neither buys the exemption
+        for key in [SHORT_PAYLOAD, OFF_CURVE_XPUB, PADDED_XPUB, TINY_PAYLOAD]:
+            with self.subTest(key=key[-8:]):
+                output = io.StringIO()
+
+                with redirect_stdout(output):
+                    indy._read_key(key)
+
+                self.assertIn('history', output.getvalue())
 
     def test_a_public_key_on_the_command_line_draws_no_warning(self) -> None:
         public = ('xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ES'
@@ -486,6 +568,46 @@ class TestSweepSummary(unittest.TestCase):
         self.assertTrue(sweep.reached_the_network)
 
 
+class TestPublicKeyScan(unittest.TestCase):
+    """
+    What a recovery does when all it was given is a public key.
+    """
+
+    def _run(self) -> Tuple[str, List[object]]:
+        """
+        Run a scan from the public key of the test vector, recording any connection attempt.
+        """
+        connections: List[object] = []
+        output = io.StringIO()
+
+        def client(**kwargs: object) -> object:
+            connections.append(kwargs)
+            raise AssertionError('The scan reached the network with nothing it could look up')
+
+        with mock.patch.object(indy, 'StratumClient', client):
+            with redirect_stdout(output):
+                asyncio.run(indy.find_utxos(TEST_SERVER, BIP32.from_xpub(BIP32_TEST_XPUB),
+                                            20, 0, None, None, False, True))
+
+        return output.getvalue(), connections
+
+    def test_a_public_key_is_turned_down_before_any_server_is_reached(self) -> None:
+        _, connections = self._run()
+
+        self.assertEqual(connections, [])
+
+    def test_the_reason_names_what_stands_in_the_way(self) -> None:
+        output, _ = self._run()
+
+        self.assertIn('hardened', output)
+        self.assertIn('private key', output)
+
+    def test_no_funds_are_claimed_either_way(self) -> None:
+        output, _ = self._run()
+
+        self.assertNotIn('Didn\'t find any unspent outputs', output)
+
+
 class TestServerList(unittest.TestCase):
     """
     The bundled list of Electrum servers.
@@ -564,7 +686,8 @@ class TestElectrumProtocol(unittest.TestCase):
 
         async def scan() -> None:
             with self.assertRaises(ConnectionError):
-                await indy.find_utxos(TEST_SERVER, None, 20, 0, None, None, False, True)
+                await indy.find_utxos(TEST_SERVER, BIP32.from_xpriv(BIP32_TEST_XPRIV),
+                                      20, 0, None, None, False, True)
 
         with mock.patch.object(indy, 'StratumClient', FakeClient):
             with redirect_stdout(io.StringIO()):
