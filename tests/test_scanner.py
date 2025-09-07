@@ -3,10 +3,12 @@ import asyncio
 import io
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from typing import Any, List, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
+from unittest import mock
 
 from bip32 import BIP32
 
+import descriptors
 import scanner
 import transactions
 from descriptors import DescriptorScriptIterator, Path
@@ -142,6 +144,45 @@ class FakeClient:
         return self._unspent_entries()
 
 
+class ManyAddressClient(FakeClient):
+    """
+    Electrum server holding an output at each of several addresses, each backed by a real
+    transaction, and counting how often it is asked about any of them.
+    """
+
+    def __init__(self, programs: List[bytes]) -> None:
+        super().__init__(set())
+        self.entry_of: Dict[str, dict] = {}
+        self.paid_by: Dict[str, Tuple[bytes, dict]] = {}
+        self.asked: Dict[str, int] = {}
+
+        for offset, program in enumerate(programs):
+            entry = _unspent_paying(program, amount=100_000 + offset)
+            script_hash = scanner._electrum_script_hash(program)
+
+            self.used_hashes.add(script_hash)
+            self.entry_of[script_hash] = entry
+            self.paid_by[entry['tx_hash']] = (program, entry)
+
+    def _answer(self, method: str, script_hash: str) -> object:
+        if method == self.TRANSACTION:
+            program, entry = self.paid_by[script_hash]
+            return _transaction_paying(_outputs_paying(program, entry['value'], entry['tx_pos']))
+
+        if method not in [self.HISTORY, self.UNSPENT]:
+            raise AssertionError(f'The scanner asked for an unknown method: {method}')
+
+        if script_hash not in self.used_hashes:
+            return []
+
+        if method == self.HISTORY:
+            return self.history
+
+        self.asked[script_hash] = self.asked.get(script_hash, 0) + 1
+
+        return [self.entry_of[script_hash]]
+
+
 def _run_scan(without_a_terminal: bool) -> Tuple[List[scanner.Utxo], str]:
     """
     Run a whole scan against the fake server, optionally with neither stream on a terminal.
@@ -161,6 +202,92 @@ def _run_scan(without_a_terminal: bool) -> Tuple[List[scanner.Utxo], str]:
             utxos = asyncio.run(scan())
 
     return utxos, captured.getvalue()
+
+
+class TestRepeatedOutputs(unittest.TestCase):
+    """
+    What a scan asks and reports when two descriptors spell out the same address.
+    """
+
+    # Two entries that derive the very same addresses, which is what a fixed account number and
+    # a variable one amount to as soon as the account gap reaches that number
+    CATALOGUE: Dict[str, List[ScriptType]] = {
+        "m/44'/0'/0'/0/i": [ScriptType.LEGACY],
+        "m/44'/0'/a'/0/i": [ScriptType.LEGACY],
+        "m/84'/0'/0'/0/i": [ScriptType.SEGWIT],
+    }
+
+    # A second address, on a descriptor of its own, used along with the shared one
+    OTHER_PATH = "m/84'/0'/0'/0/0"
+    OTHER_TYPE = ScriptType.SEGWIT
+
+    def _scan(self, should_batch: bool, also_use_the_other: bool = False) -> Tuple[List[scanner.Utxo],
+                                                                                  ManyAddressClient]:
+        master_key = BIP32.from_seed(BIP32_TEST_SEED)
+        programs = [_program_of(master_key, USED_PATH, USED_TYPE)]
+
+        if also_use_the_other:
+            programs.append(_program_of(master_key, self.OTHER_PATH, self.OTHER_TYPE))
+
+        client = ManyAddressClient(programs)
+
+        with mock.patch.object(descriptors, 'descriptors', self.CATALOGUE):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                utxos = asyncio.run(scanner.scan_master_key(client, master_key, 20, 0, should_batch))
+
+        return utxos, client
+
+    def test_an_output_reached_along_two_paths_is_reported_once(self) -> None:
+        # Batched or not, the second descriptor can land in a later round than the first
+        for should_batch in [True, False]:
+            with self.subTest(should_batch=should_batch):
+                utxos, _ = self._scan(should_batch)
+
+                self.assertEqual(len(utxos), 1)
+
+    def test_the_balance_is_what_the_server_holds_and_not_a_multiple_of_it(self) -> None:
+        # Counting it twice would offer a sweep of funds that are not there, and spend the same
+        # outpoint twice in the transaction that goes out
+        for should_batch in [True, False]:
+            with self.subTest(should_batch=should_batch):
+                utxos, _ = self._scan(should_batch)
+
+                self.assertEqual(sum(utxo.amount_in_sat for utxo in utxos), 100_000)
+
+    def test_an_address_two_descriptors_share_is_asked_about_once(self) -> None:
+        for should_batch in [True, False]:
+            with self.subTest(should_batch=should_batch):
+                _, client = self._scan(should_batch)
+
+                self.assertEqual(max(client.asked.values()), 1)
+
+    def test_the_descriptor_whose_request_is_skipped_still_grows(self) -> None:
+        # The fixed entry comes first here, so the variable one is the one skipped. Its account
+        # range only reaches account 2 if it went through its own history all the same, which is
+        # why the addresses are marked as used before any request is left out
+        catalogue = {
+            "m/44'/0'/1'/0/i": [ScriptType.LEGACY],
+            "m/44'/0'/a'/0/i": [ScriptType.LEGACY],
+        }
+        shared, beyond = "m/44'/0'/1'/0/0", "m/44'/0'/2'/0/0"
+        master_key = BIP32.from_seed(BIP32_TEST_SEED)
+        client = ManyAddressClient([_program_of(master_key, shared, ScriptType.LEGACY),
+                                    _program_of(master_key, beyond, ScriptType.LEGACY)])
+
+        with mock.patch.object(descriptors, 'descriptors', catalogue):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                utxos = asyncio.run(scanner.scan_master_key(client, master_key, 20, 1, True))
+
+        self.assertEqual(sorted(utxo.path.path for utxo in utxos), [shared, beyond])
+
+    def test_every_output_is_credited_to_the_address_it_came_from(self) -> None:
+        # Skipping an address shortens the batch, and a response lined up against the wrong
+        # script credits its output to a path that cannot sign for it
+        for should_batch in [True, False]:
+            with self.subTest(should_batch=should_batch):
+                utxos, _ = self._scan(should_batch, also_use_the_other=True)
+
+                self.assertEqual(sorted(utxo.path.path for utxo in utxos), [USED_PATH, self.OTHER_PATH])
 
 
 class TestScanWithoutATerminal(unittest.TestCase):
