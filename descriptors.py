@@ -16,6 +16,10 @@ descriptors = {
     # CoolWallet S the P2SH wrapped one, and Bisq, Copay and KoinKeep the native one
     "m/44'/0'/a'/0/i": [ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.SEGWIT],  # BIP44, external
     "m/44'/0'/a'/1/i": [ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.SEGWIT],  # BIP44, change
+    # Bisq and KoinKeep hold the wallet on the second account and leave the first one empty, so
+    # the account range never expands on its own and that wallet falls outside any scan
+    "m/44'/0'/1'/0/i": [ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.SEGWIT],  # BIP44 account 1, external
+    "m/44'/0'/1'/1/i": [ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.SEGWIT],  # BIP44 account 1, change
     "m/49'/0'/a'/0/i": [ScriptType.COMPAT],  # BIP49, external
     "m/49'/0'/a'/1/i": [ScriptType.COMPAT],  # BIP49, change
     "m/84'/0'/a'/0/i": [ScriptType.SEGWIT],  # BIP84, external
