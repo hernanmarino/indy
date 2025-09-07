@@ -44,6 +44,7 @@ async def scan_master_key(
     batch_size = MAX_BATCH_SIZE if should_batch else 1
     script_iter = ScriptIterator(master_key, address_gap, account_gap)
     descriptors = set()
+    fetched_hashes = set()
     outpoints = set()
     balance = 0
     utxos = []
@@ -92,17 +93,26 @@ async def scan_master_key(
                 script.set_as_used()
                 used_scripts.append(script)
 
-            # Build the next batched request
+            # Build the next batched request, asking about each address only once: two
+            # descriptors can spell out the same one, and its outputs are the same whichever
+            # of them asked. Both were marked as used above, so both keep their own gap
             batch_request = []
+            unspent_scripts = []
             for script in used_scripts:
                 hash = _electrum_script_hash(script.program)
+
+                if hash in fetched_hashes:
+                    continue
+
+                fetched_hashes.add(hash)
+                unspent_scripts.append(script)
                 batch_request.append(('blockchain.scripthash.listunspent', hash))
 
             responses = await _electrum_rpc(client, batch_request)
 
             found_here = []
 
-            for script, response in zip(used_scripts, responses):
+            for script, response in zip(unspent_scripts, responses):
                 if not isinstance(response, list):
                     raise ValueError(f'The server answered with {response!r} where a list of outputs belongs')
 

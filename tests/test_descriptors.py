@@ -289,17 +289,39 @@ class TestScriptIterator(unittest.TestCase):
                     self.assertTrue(result['terminated'])
                     self.assertEqual(result['found'], [(address, script_type)])
 
-    def test_those_script_types_reach_past_the_first_account(self) -> None:
-        # The entries this replaces named account 0, so they covered one wallet each and no more
+    def test_those_script_types_reach_whatever_account_is_asked_for(self) -> None:
+        # The entries this replaces named account 0, so they covered one wallet each and no more.
+        # Account 2 is used here because account 1 is now scanned without asking, and a wallet
+        # sitting there would be found by the entry for it rather than by the account gap
         for chain in [0, 1]:
             for script_type in ['COMPAT', 'SEGWIT']:
                 with self.subTest(chain=chain, script_type=script_type):
-                    address = f"m/44'/0'/1'/{chain}/0"
+                    address = f"m/44'/0'/2'/{chain}/0"
                     result = _scan({(address, script_type)}, batch_size=MAX_BATCH_SIZE,
-                                   max_scripts=20_000, account_gap=1)
+                                   max_scripts=40_000, account_gap=2)
 
                     self.assertTrue(result['terminated'])
                     self.assertEqual(result['found'], [(address, script_type)])
+
+    def test_the_second_bip44_account_is_scanned_without_being_asked_for(self) -> None:
+        # Bisq and KoinKeep put the wallet on account 1 and leave account 0 empty, so nothing
+        # ever expands the account range and the funds sit outside the scan
+        for chain in [0, 1]:
+            for script_type in ['LEGACY', 'COMPAT', 'SEGWIT']:
+                with self.subTest(chain=chain, script_type=script_type):
+                    address = f"m/44'/0'/1'/{chain}/0"
+                    result = _scan({(address, script_type)}, batch_size=MAX_BATCH_SIZE, max_scripts=5_000)
+
+                    self.assertTrue(result['terminated'])
+                    self.assertEqual(result['found'], [(address, script_type)])
+
+    def test_the_third_account_still_waits_to_be_asked_for(self) -> None:
+        # Only the account those two wallets name is scanned for free; the rest is what the
+        # account gap is for, and Blockchain.com, which numbers accounts freely, needs it
+        result = _scan({("m/44'/0'/2'/0/0", 'SEGWIT')}, batch_size=MAX_BATCH_SIZE, max_scripts=5_000)
+
+        self.assertTrue(result['terminated'])
+        self.assertEqual(result['found'], [])
 
     def test_no_address_is_derived_twice_under_the_same_script_type(self) -> None:
         # Two descriptors that resolve alike would look the same address up twice over
