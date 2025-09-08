@@ -159,6 +159,10 @@ class TestKeyParsing(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             return indy.parse_key(key, '', **options)
 
+    def _read(self, key: str, passphrase: str) -> BIP32:
+        with redirect_stdout(io.StringIO()):
+            return indy.parse_key(key, passphrase)
+
     def test_a_mnemonic_that_checks_out_is_read(self) -> None:
         self.assertIsNotNone(self._parse(self.VALID))
 
@@ -223,20 +227,44 @@ class TestKeyParsing(unittest.TestCase):
         # The seed is PBKDF2 over the words themselves, worked out here without the library, and
         # the passphrase belongs in its salt rather than anywhere else
         for phrase in NEW_WORDLIST_PHRASES:
-            for passphrase in ['', 'a spoken passphrase']:
+            for passphrase in ['', 'a spoken passphrase', ' held  apart \n', '\tone\ttwo\t']:
                 with self.subTest(phrase=phrase.split()[0], passphrase=passphrase):
                     salt = unicodedata.normalize('NFKD', 'mnemonic' + passphrase).encode()
                     expected = hashlib.pbkdf2_hmac('sha512', unicodedata.normalize('NFKD', phrase).encode(),
                                                    salt, 2048)
 
-                    with redirect_stdout(io.StringIO()):
-                        read = indy.parse_key(phrase, passphrase)
-
-                    self.assertEqual(read.master_privkey, BIP32.from_seed(expected).master_privkey)
+                    self.assertEqual(self._read(phrase, passphrase).master_privkey,
+                                     BIP32.from_seed(expected).master_privkey)
 
     def test_a_phrase_in_another_language_is_read(self) -> None:
         for language in ['spanish', 'french', 'japanese', 'italian']:
             self.assertIsNotNone(self._parse(Mnemonic(language).generate(128)), language)
+
+    def test_a_phrase_spaced_out_any_other_way_derives_the_same_key(self) -> None:
+        # A phrase arrives pasted out of a document or a password manager, where it picks up a
+        # trailing space or a line break. Deriving from that spelling gives a wallet nobody has
+        canonical = self._parse(self.VALID).master_privkey
+
+        for spelling in [' ' + self.VALID, self.VALID + '\n', self.VALID + '  ',
+                         self.VALID.replace(' ', '  ', 1), self.VALID.replace(' ', '\t', 1),
+                         self.VALID.replace(' ', ' \n ', 1)]:
+            with self.subTest(spelling=repr(spelling[:14])):
+                self.assertEqual(self._parse(spelling).master_privkey, canonical)
+
+    def test_the_passphrase_keeps_every_space_it_was_given(self) -> None:
+        # Settling the spacing of the phrase must not reach the passphrase: it is a secret of
+        # its own, and two that differ only in a space open two different wallets
+        spellings = [' a spoken passphrase', 'a spoken passphrase ', 'a  spoken passphrase',
+                     'a spoken\tpassphrase', 'a spoken passphrase']
+        derived = {self._read(self.VALID, spelling).master_privkey for spelling in spellings}
+
+        self.assertEqual(len(derived), len(spellings))
+
+    def test_that_holds_for_the_phrases_of_other_wordlists_too(self) -> None:
+        for phrase in NEW_WORDLIST_PHRASES:
+            with self.subTest(phrase=phrase.split()[0]):
+                self.assertEqual(self._parse(phrase + '\n').master_privkey,
+                                 self._parse(phrase).master_privkey)
 
     def test_a_mnemonic_whose_checksum_does_not_check_out_is_refused(self) -> None:
         with self.assertRaises(ValueError):

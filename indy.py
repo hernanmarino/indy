@@ -305,15 +305,19 @@ def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False) -
             pass
 
     if _is_a_mnemonic(key):
-        if not allow_invalid_checksum and not _checksum_matches(key):
+        # A phrase arrives with whatever spacing the document it was copied out of had, and the
+        # seed is built out of the text itself, so it is checked and derived in one same form
+        words = ' '.join(Mnemonic.normalize_string(key).split())
+
+        if not allow_invalid_checksum and not _checksum_matches(words):
             raise ValueError(
                 'Those words don\'t add up: the BIP39 checksum doesn\'t match, which usually means a '
                 'word was mistyped or two were swapped. An Electrum seed phrase uses the same words '
                 'but is not BIP39, and lands here too. Pass `--allow-invalid-checksum` to derive from '
-                'the words as given anyway.'
+                'those words anyway.'
             )
 
-        seed = Mnemonic.to_seed(key, passphrase=passphrase)
+        seed = Mnemonic.to_seed(words, passphrase=passphrase)
         private_key = BIP32.from_seed(seed)
         print('🔑  Read mnemonic successfully')
         return private_key
