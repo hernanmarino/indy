@@ -213,13 +213,40 @@ def _read_passphrase(given: str, should_ask: bool) -> str:
     return given
 
 
+def _is_a_mnemonic(words: str) -> bool:
+    """
+    Whether a phrase is written in some BIP39 wordlist, whichever of them it turns out to be.
+    """
+    return any(_is_written_in(words, language) for language in Mnemonic.list_languages())
+
+
+def _is_written_in(words: str, language: str) -> bool:
+    """
+    Whether every word of a phrase belongs to the wordlist of a given language.
+    """
+    wordlist = set(_wordlist_of(language))
+    written = Mnemonic.normalize_string(words).split()
+
+    return len(written) > 0 and all(word in wordlist for word in written)
+
+
+def _wordlist_of(language: str) -> List[str]:
+    """
+    The wordlist of a language, written the way the words of a phrase arrive.
+    """
+    # The Turkish and Russian lists are not printed in the form a phrase comes in, and the
+    # library looks its own words up as printed, so it cannot check a phrase in either of them
+    return [Mnemonic.normalize_string(word) for word in Mnemonic(language).wordlist]
+
+
 def _checksum_matches(words: str) -> bool:
     """
     Whether these words carry a valid BIP39 checksum in any of the wordlists.
     """
-    # Several wordlists share words, and detect_language settles on the first that fits them all,
-    # which is not always the one the phrase was written in: the BIP39 test vector reads as French
-    return any(Mnemonic(language).check(words) for language in Mnemonic.list_languages())
+    # Wordlists share words, so a phrase can be written in more than one of them at once, and
+    # the checksum is what settles which one it was really written in
+    return any(Mnemonic(language, wordlist=_wordlist_of(language)).check(words)
+               for language in Mnemonic.list_languages())
 
 
 def _key_data(key: str) -> Optional[bytes]:
@@ -277,21 +304,20 @@ def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False) -
         except Exception:
             pass
 
-    try:
-        language = Mnemonic.detect_language(key)
-    except Exception:
-        language = None
+    if _is_a_mnemonic(key):
+        # A phrase arrives with whatever spacing the document it was copied out of had, and the
+        # seed is built out of the text itself, so it is checked and derived in one same form
+        words = ' '.join(Mnemonic.normalize_string(key).split())
 
-    if language is not None:
-        if not allow_invalid_checksum and not _checksum_matches(key):
+        if not allow_invalid_checksum and not _checksum_matches(words):
             raise ValueError(
                 'Those words don\'t add up: the BIP39 checksum doesn\'t match, which usually means a '
                 'word was mistyped or two were swapped. An Electrum seed phrase uses the same words '
                 'but is not BIP39, and lands here too. Pass `--allow-invalid-checksum` to derive from '
-                'the words as given anyway.'
+                'those words anyway.'
             )
 
-        seed = Mnemonic(language).to_seed(key, passphrase=passphrase)
+        seed = Mnemonic.to_seed(words, passphrase=passphrase)
         private_key = BIP32.from_seed(seed)
         print('🔑  Read mnemonic successfully')
         return private_key

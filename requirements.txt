@@ -1,5 +1,5 @@
 bip32==0.0.7
-mnemonic==0.19
+mnemonic==0.21
 bech32==1.2.0
 base58==2.0.0
 coincurve==13.0.0
