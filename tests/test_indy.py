@@ -183,6 +183,33 @@ class TestKeyParsing(unittest.TestCase):
             with self.subTest(phrase=phrase.split()[0]):
                 self.assertTrue(indy._is_a_mnemonic(phrase))
 
+    def test_a_phrase_written_in_another_form_checks_out_all_the_same(self) -> None:
+        # These came out of the library itself, so their checksums are right by construction,
+        # and yet it turns them down when asked to read them back
+        for phrase in COMPOSED_PHRASES:
+            with self.subTest(phrase=phrase.split()[0]):
+                self.assertTrue(indy._checksum_matches(phrase))
+                self.assertIsNotNone(self._parse(phrase))
+
+    def test_the_checksum_is_read_the_same_way_for_every_wordlist(self) -> None:
+        # A phrase the library builds always checks out, at every length BIP39 defines, and
+        # these particular one-word substitutions do not: a checksum can always agree by chance
+        for language in Mnemonic.list_languages():
+            for size in [16, 20, 24, 28, 32]:
+                phrase = Mnemonic(language).to_mnemonic(bytes([size]) * size)
+                words = phrase.split()
+
+                with self.subTest(language=language, words=len(words)):
+                    self.assertTrue(indy._checksum_matches(phrase))
+
+                    elsewhere = Mnemonic(language).wordlist[(size + 1) % 2048]
+                    self.assertFalse(indy._checksum_matches(' '.join(words[:-1] + [elsewhere])))
+
+    def test_a_phrase_of_a_length_bip39_does_not_define_is_refused(self) -> None:
+        for count in [11, 13, 23, 25]:
+            with self.subTest(count=count):
+                self.assertFalse(indy._checksum_matches(' '.join(['abandon'] * count)))
+
     def test_something_spelled_like_words_but_in_no_wordlist_is_not(self) -> None:
         self.assertFalse(indy._is_a_mnemonic('these words are not in any wordlist at all'))
         self.assertFalse(indy._is_a_mnemonic(''))

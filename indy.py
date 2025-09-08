@@ -224,12 +224,19 @@ def _is_written_in(words: str, language: str) -> bool:
     """
     Whether every word of a phrase belongs to the wordlist of a given language.
     """
-    # Both sides are normalized: the Turkish and Russian wordlists are not written in the same
-    # form the words come in, and a plain comparison misses them
-    wordlist = {Mnemonic.normalize_string(word) for word in Mnemonic(language).wordlist}
+    wordlist = set(_wordlist_of(language))
     written = Mnemonic.normalize_string(words).split()
 
     return len(written) > 0 and all(word in wordlist for word in written)
+
+
+def _wordlist_of(language: str) -> List[str]:
+    """
+    The wordlist of a language, written the way the words of a phrase arrive.
+    """
+    # The Turkish and Russian lists are not printed in the form a phrase comes in, and the
+    # library looks its own words up as printed, so it cannot check a phrase in either of them
+    return [Mnemonic.normalize_string(word) for word in Mnemonic(language).wordlist]
 
 
 def _checksum_matches(words: str) -> bool:
@@ -238,7 +245,8 @@ def _checksum_matches(words: str) -> bool:
     """
     # Wordlists share words, so a phrase can be written in more than one of them at once, and
     # the checksum is what settles which one it was really written in
-    return any(Mnemonic(language).check(words) for language in Mnemonic.list_languages())
+    return any(Mnemonic(language, wordlist=_wordlist_of(language)).check(words)
+               for language in Mnemonic.list_languages())
 
 
 def _key_data(key: str) -> Optional[bytes]:
