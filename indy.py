@@ -213,12 +213,31 @@ def _read_passphrase(given: str, should_ask: bool) -> str:
     return given
 
 
+def _is_a_mnemonic(words: str) -> bool:
+    """
+    Whether a phrase is written in some BIP39 wordlist, whichever of them it turns out to be.
+    """
+    return any(_is_written_in(words, language) for language in Mnemonic.list_languages())
+
+
+def _is_written_in(words: str, language: str) -> bool:
+    """
+    Whether every word of a phrase belongs to the wordlist of a given language.
+    """
+    # Both sides are normalized: the Turkish and Russian wordlists are not written in the same
+    # form the words come in, and a plain comparison misses them
+    wordlist = {Mnemonic.normalize_string(word) for word in Mnemonic(language).wordlist}
+    written = Mnemonic.normalize_string(words).split()
+
+    return len(written) > 0 and all(word in wordlist for word in written)
+
+
 def _checksum_matches(words: str) -> bool:
     """
     Whether these words carry a valid BIP39 checksum in any of the wordlists.
     """
-    # Several wordlists share words, and detect_language settles on the first that fits them all,
-    # which is not always the one the phrase was written in: the BIP39 test vector reads as French
+    # Wordlists share words, so a phrase can be written in more than one of them at once, and
+    # the checksum is what settles which one it was really written in
     return any(Mnemonic(language).check(words) for language in Mnemonic.list_languages())
 
 
@@ -277,12 +296,7 @@ def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False) -
         except Exception:
             pass
 
-    try:
-        language = Mnemonic.detect_language(key)
-    except Exception:
-        language = None
-
-    if language is not None:
+    if _is_a_mnemonic(key):
         if not allow_invalid_checksum and not _checksum_matches(key):
             raise ValueError(
                 'Those words don\'t add up: the BIP39 checksum doesn\'t match, which usually means a '
@@ -291,7 +305,7 @@ def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False) -
                 'the words as given anyway.'
             )
 
-        seed = Mnemonic(language).to_seed(key, passphrase=passphrase)
+        seed = Mnemonic.to_seed(key, passphrase=passphrase)
         private_key = BIP32.from_seed(seed)
         print('🔑  Read mnemonic successfully')
         return private_key

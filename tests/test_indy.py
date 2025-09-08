@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 import asyncio
+import hashlib
 import getpass
 import io
 import json
 import os
 import sys
 import tempfile
+import unicodedata
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from typing import List, Optional, Tuple
@@ -52,6 +54,24 @@ TINY_PAYLOAD = '2fgFdLat59SRaKu9M1a'
 # The test vector with ten bytes stuck on the end: a real point sits where one is looked for
 PADDED_XPUB = ('EqvLcMFcyzsxd3n8vc3j14D5Hy2rqrhyHwqhPiWia1TPjEQQ4rWquydPDb2XkDSEebJHyT9N'
                'DUExWFPV3vqKcG3UVi15aYm5nB7nm1LrrZqkuT6PkZaCd8maXNVkJ')
+
+# One phrase per wordlist that only the newer library knows, all of them over an entropy of
+# zeroes, which is why each is its first word repeated
+NEW_WORDLIST_PHRASES = [
+    'abdikace ' * 11 + 'agrese',
+    'abacate ' * 11 + 'abater',
+    'абзац ' * 11 + 'авангард',
+    'abajur ' * 11 + 'abdal',
+]
+
+# Phrases whose words are not written the way the wordlist writes them, which is the case for
+# roughly a third of the Turkish list and an eighth of the Russian one
+COMPOSED_PHRASES = [
+    ('aforizm bermuda sipariş aktif donanım misafir '
+     'anne karşıt aforizm bermuda sipariş alçak'),
+    ('бабочка другой служба бред мокрый ограда '
+     'вовремя удачный бабочка другой служба букет'),
+]
 
 # A server reached over TLS, as every server in the bundled list is
 TEST_SERVER = ServerInfo('example.invalid', hostname='example.invalid', ports='s50002')
@@ -142,12 +162,50 @@ class TestKeyParsing(unittest.TestCase):
     def test_a_mnemonic_that_checks_out_is_read(self) -> None:
         self.assertIsNotNone(self._parse(self.VALID))
 
-    def test_a_phrase_read_as_the_wrong_language_still_checks_out(self) -> None:
-        # Wordlists overlap, and the library settles on the first that fits every word: this very
-        # phrase, the BIP39 test vector, reads as French, where its checksum does not match
-        self.assertEqual(Mnemonic.detect_language(self.VALID), 'french')
+    def test_a_phrase_that_fits_two_wordlists_is_read_all_the_same(self) -> None:
+        # Wordlists overlap, and every word of this one is both French and English. Which of the
+        # two it is called does not matter: BIP39 turns the words themselves into the seed
+        with self.assertRaises(Exception):
+            Mnemonic.detect_language(self.BROKEN_CHECKSUM)
 
-        self.assertIsNotNone(self._parse(self.VALID))
+        self.assertIsNotNone(self._parse(self.BROKEN_CHECKSUM, allow_invalid_checksum=True))
+
+    def test_a_phrase_from_any_wordlist_is_taken_for_one(self) -> None:
+        # Same entropy for every language, so the phrases are fixed rather than drawn at random
+        for language in Mnemonic.list_languages():
+            with self.subTest(language=language):
+                self.assertTrue(indy._is_a_mnemonic(Mnemonic(language).to_mnemonic(bytes(16))))
+
+    def test_a_phrase_written_in_another_form_than_its_wordlist_is_taken_for_one(self) -> None:
+        # Turkish and Russian words carry marks that compose two ways, and the wordlist does not
+        # spell them the way a phrase arrives
+        for phrase in COMPOSED_PHRASES:
+            with self.subTest(phrase=phrase.split()[0]):
+                self.assertTrue(indy._is_a_mnemonic(phrase))
+
+    def test_something_spelled_like_words_but_in_no_wordlist_is_not(self) -> None:
+        self.assertFalse(indy._is_a_mnemonic('these words are not in any wordlist at all'))
+        self.assertFalse(indy._is_a_mnemonic(''))
+
+    def test_the_wordlists_that_wallets_ask_for_are_there(self) -> None:
+        # Trezor writes its phrases in Czech, and Portuguese is the other one BIP39 added
+        for language in ['czech', 'portuguese']:
+            self.assertIn(language, Mnemonic.list_languages())
+
+    def test_a_phrase_from_one_of_those_derives_what_bip39_says_it_should(self) -> None:
+        # The seed is PBKDF2 over the words themselves, worked out here without the library, and
+        # the passphrase belongs in its salt rather than anywhere else
+        for phrase in NEW_WORDLIST_PHRASES:
+            for passphrase in ['', 'a spoken passphrase']:
+                with self.subTest(phrase=phrase.split()[0], passphrase=passphrase):
+                    salt = unicodedata.normalize('NFKD', 'mnemonic' + passphrase).encode()
+                    expected = hashlib.pbkdf2_hmac('sha512', unicodedata.normalize('NFKD', phrase).encode(),
+                                                   salt, 2048)
+
+                    with redirect_stdout(io.StringIO()):
+                        read = indy.parse_key(phrase, passphrase)
+
+                    self.assertEqual(read.master_privkey, BIP32.from_seed(expected).master_privkey)
 
     def test_a_phrase_in_another_language_is_read(self) -> None:
         for language in ['spanish', 'french', 'japanese', 'italian']:
