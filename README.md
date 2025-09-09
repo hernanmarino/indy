@@ -37,6 +37,11 @@ pip3 install -r requirements.txt
 python3 indy.py --help
 ```
 
+Every dependency is pinned to a version and to the hashes of the files it is made of, so pip
+turns down a file that does not match what is written down. Except on 32 and 64 bit Windows,
+one of them is compiled while installing: that needs a C toolchain, and it fetches its C
+library over the network as it builds.
+
 ## Usage
 
 The key is asked for out of sight when it is left off the command line, so that it stays out of

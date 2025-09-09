@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import hashlib
+import re
 import getpass
 import io
 import json
@@ -10,7 +11,8 @@ import tempfile
 import unicodedata
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from typing import List, Optional, Tuple
+from importlib import metadata
+from typing import List, Optional, Set, Tuple
 from unittest import mock
 
 from bip32 import BIP32
@@ -775,6 +777,116 @@ class TestServerList(unittest.TestCase):
         for server in indy._read_servers():
             self.assertIn('host', server)
             self.assertIn('port', server)
+
+
+class TestRequirements(unittest.TestCase):
+    """
+    What the file that pins the dependencies says. Whether pip accepts the hashes is not
+    something a test can tell: that is what installing it says, and it is done by hand.
+    """
+
+    HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def setUp(self) -> None:
+        with open(os.path.join(self.HERE, 'requirements.txt'), encoding='utf-8') as requirements:
+            self.lines = [line.strip() for line in requirements
+                          if line.strip() and not line.startswith('#')]
+
+    def _pinned(self) -> List[Tuple[str, List[str]]]:
+        """
+        Every requirement the file states, along with the hashes given for it.
+        """
+        pinned: List[Tuple[str, List[str]]] = []
+
+        for line in self.lines:
+            if line.startswith('--hash='):
+                pinned[-1][1].append(line.split('--hash=')[1].rstrip(' \\'))
+            else:
+                pinned.append((line.rstrip(' \\'), []))
+
+        return pinned
+
+    def _names(self) -> Set[str]:
+        """
+        The package each requirement names, without its version or its marker.
+        """
+        return {requirement.split('==')[0].split(';')[0].strip().lower()
+                for requirement, _ in self._pinned()}
+
+    def test_every_requirement_names_one_version_and_carries_a_hash(self) -> None:
+        for requirement, hashes in self._pinned():
+            with self.subTest(requirement=requirement):
+                self.assertRegex(requirement.split(';')[0].strip(), r'^[\w.-]+==[\w.]+$')
+                self.assertTrue(hashes)
+
+    def test_every_hash_is_a_sha256(self) -> None:
+        for requirement, hashes in self._pinned():
+            for hash in hashes:
+                with self.subTest(requirement=requirement, hash=hash[:16]):
+                    self.assertRegex(hash, r'^sha256:[0-9a-f]{64}$')
+
+    def test_every_library_the_tool_imports_is_pinned(self) -> None:
+        # Adding an import without pinning what it comes from leaves pip nothing to check it by
+        modules = {name[:-3] for name in os.listdir(self.HERE) if name.endswith('.py')}
+        imported = set()
+
+        for name in sorted(modules):
+            with open(os.path.join(self.HERE, f'{name}.py'), encoding='utf-8') as source:
+                for line in source:
+                    found = re.match(r'(?:from|import)\s+([A-Za-z_][\w]*)', line)
+                    if found:
+                        imported.add(found.group(1))
+
+        third_party = imported - modules - set(sys.stdlib_module_names)
+
+        self.assertTrue(third_party)
+        self.assertLessEqual({name.lower() for name in third_party}, self._names())
+
+    def test_every_dependency_the_installed_ones_declare_is_pinned_too(self) -> None:
+        # pip wants a hash for everything it installs, and the ones nobody asked for by name
+        # are exactly the ones that go missing. This reaches as far as the metadata of what is
+        # installed here: a package this platform never installs is covered by the test below
+        pinned = self._names()
+
+        for name in sorted(pinned):
+            try:
+                required = metadata.requires(name) or []
+            except metadata.PackageNotFoundError:
+                continue
+
+            for entry in required:
+                if 'extra ==' in entry:
+                    continue
+
+                needed = re.split(r'[\s;<>=!\[(]', entry, maxsplit=1)[0].strip().lower()
+
+                with self.subTest(package=name, needs=needed):
+                    self.assertIn(needed, pinned)
+
+    def test_a_package_this_platform_never_installs_says_so_in_a_marker(self) -> None:
+        # Nothing here can read the metadata of a package that was never installed, so what
+        # stands for it is the marker: pinned, absent, and unexplained is the shape of a
+        # dependency that will be missing on the platform that does install it
+        for requirement, _ in self._pinned():
+            name = requirement.split('==')[0].split(';')[0].strip()
+
+            try:
+                metadata.version(name)
+            except metadata.PackageNotFoundError:
+                with self.subTest(package=name):
+                    self.assertIn(';', requirement)
+
+    def test_what_only_one_platform_asks_for_says_which_one(self) -> None:
+        # tqdm asks for colorama on Windows alone, and a marker is what keeps it from being
+        # installed everywhere else while still giving pip its hash over there
+        for requirement, hashes in self._pinned():
+            if requirement.startswith('colorama'):
+                self.assertIn('platform_system == "Windows"', requirement)
+                self.assertRegex(requirement, r'^colorama==\d')
+                self.assertGreater(len(hashes), 1)
+                return
+
+        self.fail('colorama is not pinned, and the install asks for it on Windows')
 
 
 class TestElectrumProtocol(unittest.TestCase):
