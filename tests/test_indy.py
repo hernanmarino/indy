@@ -15,7 +15,8 @@ from importlib import metadata
 from typing import List, Optional, Set, Tuple
 from unittest import mock
 
-from bip32 import BIP32
+import base58
+from bip32 import BIP32, HARDENED_INDEX
 from connectrum.client import StratumClient
 from connectrum.svr_info import ServerInfo
 from mnemonic import Mnemonic
@@ -74,6 +75,42 @@ COMPOSED_PHRASES = [
     ('бабочка другой служба бред мокрый ограда '
      'вовремя удачный бабочка другой служба букет'),
 ]
+
+# Seed phrases from the test suite of Electrum itself, with the extended keys it derives for
+# them: the standard one off the master key, the segwit one at m/0'
+ELECTRUM_STANDARD = 'cycle rocket west magnet parrot shuffle foot correct salt library feed song'
+ELECTRUM_STANDARD_XPUB = ('xpub661MyMwAqRbcFWohJWt7PHsFEJfZAvw9ZxwQoDa4SoMgsDDM1T7WK3u9E4edk'
+                          'C4ugRnZ8E4xDZRpk8Rnts3Nbt97dPwT52CwBdDWroaZf8U')
+ELECTRUM_SEGWIT = 'bitter grass shiver impose acquire brush forget axis eager alone wine silver'
+ELECTRUM_SEGWIT_ZPUB = ('zpub6nsHdRuY92FsMKdbn9BfjBCG6X8pyhCibNP6uDvpnw2cyrVhecvHRMa3Ne8kd'
+                        'JZxjxgwnpbHLkcR4bfnhHy6auHPJyDTQ3kianeuVLdkCYQ')
+
+# A BIP39 phrase whose checksum is good and whose Electrum version happens to read as one of
+# theirs: about one phrase in two hundred does
+COLLIDING_PHRASE = 'proud tourist abstract deer wedding remain indicate loyal spray sense liar vague'
+
+# Fifteen words whose Electrum version reads as two-factor, a length at which Electrum never
+# gives that wallet. Their BIP39 checksum does not add up either, so what they deserve is the
+# refusal that names the checksum, not the one that names a wallet they are not
+FIFTEEN_WORDS_READING_AS_2FA = ('rubber add arrest upon find radar during usage laptop where '
+                                'rocket muffin void similar prevent')
+
+# Fifteen words that read as an Electrum standard wallet. Electrum gives that wallet at any
+# length, so the rule that bounds the two-factor one must not reach this
+FIFTEEN_WORDS_READING_AS_STANDARD = ('delay chunk feel possible giant galaxy urge aware panic '
+                                     'scrub satoshi prefer tip find daughter')
+
+# Fifteen words reading as the segwit two-factor version, which Electrum calls two-factor at
+# any length, and twenty-six reading as the other one, which it counts the words of
+FIFTEEN_WORDS_READING_AS_2FA_SEGWIT = ('near foot guess they beyond toilet impose oval abandon '
+                                       'hazard paddle cotton six normal nature')
+TWENTY_SIX_WORDS_READING_AS_2FA = ('dad fatal order crater rent rebel pretty long retire orbit '
+                                   'used gift treat feature skate tide usual juice doll trap '
+                                   'quiz harvest degree unlock stable blush')
+
+# A 2FA phrase, which this cannot build the wallet of
+ELECTRUM_2FA = ('bind clever room kidney crucial sausage spy edit canvas soul liquid ribbon '
+                'slam open alpha suffer gate relax voice carpet law hill woman tonight abstract')
 
 # A server reached over TLS, as every server in the bundled list is
 TEST_SERVER = ServerInfo('example.invalid', hostname='example.invalid', ports='s50002')
@@ -323,6 +360,143 @@ class TestKeyParsing(unittest.TestCase):
             with self.subTest(key=key[-8:]):
                 with self.assertRaises(ValueError):
                     self._parse(key)
+
+    def test_a_standard_electrum_phrase_derives_the_key_electrum_derives(self) -> None:
+        # Same words as BIP39 uses, salted with 'electrum' instead of 'mnemonic', which is a
+        # whole other wallet. The key below is the one Electrum's own tests expect
+        self.assertEqual(self._parse(ELECTRUM_STANDARD).get_master_xpub(), ELECTRUM_STANDARD_XPUB)
+
+    def test_a_segwit_electrum_phrase_derives_the_key_electrum_derives(self) -> None:
+        # Electrum writes this one under the SLIP-132 prefix that goes with the script type,
+        # which is the same key spelled another way
+        derived = self._parse(ELECTRUM_SEGWIT).get_xpub_from_path([HARDENED_INDEX])
+        under_slip132 = base58.b58encode_check(bytes.fromhex('04b24746')
+                                               + base58.b58decode_check(derived)[4:]).decode()
+
+        self.assertEqual(under_slip132, ELECTRUM_SEGWIT_ZPUB)
+
+    def test_an_electrum_phrase_is_not_read_as_bip39(self) -> None:
+        # Its checksum is not a BIP39 one, so reading it as BIP39 was refusing it outright
+        for phrase in [ELECTRUM_STANDARD, ELECTRUM_SEGWIT]:
+            with self.subTest(phrase=phrase.split()[0]):
+                self.assertFalse(indy._checksum_matches(phrase))
+                self.assertIsNotNone(self._parse(phrase))
+
+    def test_a_bip39_phrase_is_not_taken_for_an_electrum_one(self) -> None:
+        # Its Electrum version reads as standard by chance, and taking it that way derives a
+        # wallet nobody owns, which is the way funds go missing without a word being said
+        self.assertIsNotNone(indy._electrum_version_of(COLLIDING_PHRASE))
+        self.assertTrue(indy._checksum_matches(COLLIDING_PHRASE))
+
+        expected = Mnemonic('english').to_seed(COLLIDING_PHRASE)
+
+        self.assertEqual(self._parse(COLLIDING_PHRASE).master_privkey,
+                         BIP32.from_seed(expected).master_privkey)
+
+    def test_reading_it_both_ways_is_said_out_loud(self) -> None:
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            indy.parse_key(COLLIDING_PHRASE, '')
+
+        self.assertIn('Electrum', output.getvalue())
+        self.assertIn('--electrum', output.getvalue())
+
+    def test_the_other_reading_can_be_asked_for(self) -> None:
+        with redirect_stdout(io.StringIO()):
+            as_electrum = indy.parse_key(COLLIDING_PHRASE, '', prefer_electrum=True)
+            as_bip39 = indy.parse_key(COLLIDING_PHRASE, '')
+
+        self.assertNotEqual(as_electrum.master_privkey, as_bip39.master_privkey)
+
+    def test_only_one_of_the_two_factor_versions_answers_to_a_word_count(self) -> None:
+        # Electrum counts the words of the legacy one alone. The segwit one is two-factor at
+        # any length, so turning fifteen of those down would be reading it as something else
+        self.assertEqual(indy._electrum_version_of(FIFTEEN_WORDS_READING_AS_2FA_SEGWIT), '102')
+
+        with self.assertRaises(ValueError) as refused:
+            self._parse(FIFTEEN_WORDS_READING_AS_2FA_SEGWIT)
+
+        self.assertIn('two-factor', str(refused.exception).lower())
+
+    def test_the_counted_version_reaches_past_the_lengths_a_list_would_hold(self) -> None:
+        # Twenty and up, rather than a list that stops somewhere
+        self.assertEqual(len(TWENTY_SIX_WORDS_READING_AS_2FA.split()), 26)
+        self.assertEqual(indy._electrum_version_of(TWENTY_SIX_WORDS_READING_AS_2FA), '101')
+
+    def test_a_phrase_of_a_length_electrum_never_gives_2fa_is_not_turned_down(self) -> None:
+        # Electrum only calls a version of 101 two-factor at twelve words, or at twenty and up
+        self.assertEqual(len(FIFTEEN_WORDS_READING_AS_2FA.split()), 15)
+        self.assertIsNone(indy._electrum_version_of(FIFTEEN_WORDS_READING_AS_2FA))
+
+        with self.assertRaises(ValueError) as refused:
+            self._parse(FIFTEEN_WORDS_READING_AS_2FA)
+
+        self.assertIn('checksum', str(refused.exception).lower())
+        self.assertNotIn('two-factor', str(refused.exception).lower())
+
+    def test_a_standard_phrase_is_read_at_a_length_the_two_factor_rule_bounds(self) -> None:
+        # Only the two-factor version answers to a length, so fifteen words still read as the
+        # standard wallet they are
+        self.assertEqual(len(FIFTEEN_WORDS_READING_AS_STANDARD.split()), 15)
+        self.assertEqual(indy._electrum_version_of(FIFTEEN_WORDS_READING_AS_STANDARD), '01')
+
+        expected = hashlib.pbkdf2_hmac('sha512', FIFTEEN_WORDS_READING_AS_STANDARD.encode(),
+                                       b'electrum', 2048)
+
+        self.assertEqual(self._parse(FIFTEEN_WORDS_READING_AS_STANDARD).master_privkey,
+                         BIP32.from_seed(expected).master_privkey)
+
+    def test_a_phrase_written_without_spaces_between_its_characters(self) -> None:
+        # Electrum drops the space between two Japanese or Chinese characters before weighing
+        # the words, where a space is how the words are laid out rather than what parts them
+        self.assertEqual(indy._electrum_text('\u3042\u3044 \u3046\u3048'), '\u3042\u3044\u3046\u3048')
+        self.assertEqual(indy._electrum_text('\u5b89 \u5fc3'), '\u5b89\u5fc3')
+        self.assertEqual(indy._electrum_text('one two'), 'one two')
+
+    def test_an_electrum_phrase_is_read_however_it_is_written(self) -> None:
+        # Electrum settles the case and the spacing of a phrase before it does anything with
+        # the words, so the same phrase written another way is the same wallet
+        canonical = self._parse(ELECTRUM_STANDARD).master_privkey
+
+        for spelling in [ELECTRUM_STANDARD.upper(), ELECTRUM_STANDARD.replace(' ', '  ', 1),
+                         '  ' + ELECTRUM_STANDARD + '\n', ELECTRUM_STANDARD.capitalize()]:
+            with self.subTest(spelling=repr(spelling[:12])):
+                self.assertEqual(self._parse(spelling).master_privkey, canonical)
+
+    def test_electrum_reads_a_phrase_with_its_marks_taken_off(self) -> None:
+        # Its wordlists carry Spanish and Portuguese, where a word is written with a mark or
+        # without one and means the same, so the marks come off before the words are weighed
+        self.assertEqual(indy._electrum_text('Cafe\u0301  \u00d1andu'), 'cafe nandu')
+        self.assertEqual(indy._electrum_text('caf\u00e9 \u00f1and\u00fa'), 'cafe nandu')
+
+    def test_the_passphrase_of_an_electrum_phrase_goes_into_its_salt(self) -> None:
+        # Worked out here without the tool: Electrum salts with 'electrum' and the passphrase,
+        # where BIP39 salts with 'mnemonic' and it
+        for passphrase in ['', 'una frase', 'otra']:
+            with self.subTest(passphrase=passphrase):
+                expected = hashlib.pbkdf2_hmac('sha512', ELECTRUM_STANDARD.encode(),
+                                               b'electrum' + passphrase.encode(), 2048)
+
+                self.assertEqual(self._read(ELECTRUM_STANDARD, passphrase).master_privkey,
+                                 BIP32.from_seed(expected).master_privkey)
+
+    def test_two_passphrases_open_two_electrum_wallets(self) -> None:
+        derived = {self._read(ELECTRUM_STANDARD, passphrase).master_privkey
+                   for passphrase in ['', 'una frase', 'otra']}
+
+        self.assertEqual(len(derived), 3)
+
+    def test_a_two_factor_electrum_phrase_says_it_cannot_be_swept(self) -> None:
+        # The words carry two of its three keys; what they need is a multisig this cannot build
+        with self.assertRaises(ValueError) as refused:
+            self._parse(ELECTRUM_2FA)
+
+        refusal = str(refused.exception).lower()
+
+        self.assertIn('two-factor', refusal)
+        self.assertIn('two of the three keys', refusal)
+        self.assertIn('electrum restores it', refusal)
 
     def test_something_that_is_no_kind_of_key_is_refused(self) -> None:
         with self.assertRaises(ValueError):

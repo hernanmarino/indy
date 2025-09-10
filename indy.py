@@ -2,10 +2,13 @@
 import argparse
 import asyncio
 import getpass
+import hashlib
+import hmac
 import json
 import math
 import os
 import random
+import unicodedata
 from decimal import Decimal
 from typing import List, Optional
 
@@ -26,6 +29,27 @@ ELECTRUM_PROTOCOL_VERSIONS = ['1.4', '1.4.2']
 
 SATOSHIS_PER_BITCOIN = 10 ** 8
 BYTES_PER_KILOBYTE = 1_000
+
+# Electrum writes its phrases with the same words as BIP39 and tells its own apart by a version
+# it works out of them. The two kinds it makes today are a standard wallet and a segwit one; the
+# other two are wallets held with a server, which take a multisig this tool does not build
+ELECTRUM_VERSION_KEY = b'Seed version'
+ELECTRUM_STANDARD_VERSION = '01'
+ELECTRUM_SEGWIT_VERSION = '100'
+ELECTRUM_TWO_FACTOR_VERSIONS = ['101', '102']
+ELECTRUM_COUNTED_TWO_FACTOR_VERSION = '101'
+ELECTRUM_SALT = b'electrum'
+PBKDF2_ROUNDS = 2048
+
+# Of the two, only the first answers to a word count: Electrum calls it two-factor at twelve
+# words, or at twenty and up, and the segwit one at any length
+ELECTRUM_TWO_FACTOR_SHORT_LENGTH = 12
+ELECTRUM_TWO_FACTOR_LONG_LENGTH = 20
+
+# Electrum drops the space between two characters of the scripts its wordlists are written in,
+# where a space is a way of writing rather than a separator. These cover its own wordlists:
+# hiragana, katakana and the ideographs of the Chinese and Japanese ones
+CJK_RANGES = [(0x3040, 0x30ff), (0x3400, 0x4dbf), (0x4e00, 0x9fff), (0xf900, 0xfaff)]
 
 # An extended key carries its key data last: a private one marks it with a leading zero, and a
 # public one is the point itself, which is what the curve is asked about rather than the marker
@@ -57,6 +81,8 @@ def main():
                                    help='ask for the passphrase out of sight instead of reading it here')
     parser.add_argument('--allow-invalid-checksum', default=False, action='store_true',
                         help='derive from a mnemonic whose BIP39 checksum does not match')
+    parser.add_argument('--electrum', default=False, action='store_true',
+                        help='read the phrase as Electrum\'s when it reads as BIP39 as well')
 
     sweep_tx = parser.add_argument_group('sweep transaction')
 
@@ -103,7 +129,7 @@ def main():
     key = _read_key(args.key)
     passphrase = _read_passphrase(args.passphrase, args.ask_passphrase)
 
-    master_key = parse_key(key, passphrase, args.allow_invalid_checksum)
+    master_key = parse_key(key, passphrase, args.allow_invalid_checksum, args.electrum)
 
     if args.host is not None:
         port = (args.protocol + str(args.port)) if args.port else args.protocol
@@ -213,6 +239,60 @@ def _read_passphrase(given: str, should_ask: bool) -> str:
     return given
 
 
+def _electrum_version_of(words: str) -> Optional[str]:
+    """
+    The version an Electrum phrase carries, or nothing if these words are not one of its own.
+    """
+    version = hmac.new(ELECTRUM_VERSION_KEY, _electrum_text(words).encode(), hashlib.sha512).hexdigest()
+
+    for known in [ELECTRUM_STANDARD_VERSION, ELECTRUM_SEGWIT_VERSION] + ELECTRUM_TWO_FACTOR_VERSIONS:
+        if not version.startswith(known):
+            continue
+
+        if known == ELECTRUM_COUNTED_TWO_FACTOR_VERSION and not _is_a_two_factor_length(words):
+            return None
+
+        return known
+
+    return None
+
+
+def _is_a_two_factor_length(words: str) -> bool:
+    """
+    Whether a phrase is as long as the two-factor wallet Electrum counts the words of.
+    """
+    counted = len(words.split())
+
+    return counted == ELECTRUM_TWO_FACTOR_SHORT_LENGTH or counted >= ELECTRUM_TWO_FACTOR_LONG_LENGTH
+
+
+def _electrum_seed(words: str, passphrase: str) -> bytes:
+    """
+    Stretch an Electrum phrase into a seed, which is BIP39's way over a salt of its own.
+    """
+    return hashlib.pbkdf2_hmac('sha512', _electrum_text(words).encode(),
+                               ELECTRUM_SALT + _electrum_text(passphrase).encode(), PBKDF2_ROUNDS)
+
+
+def _electrum_text(words: str) -> str:
+    """
+    Write a phrase the single way Electrum reads it before doing anything with the words.
+    """
+    written = unicodedata.normalize('NFKD', words).lower()
+    written = ''.join(letter for letter in written if not unicodedata.combining(letter))
+    written = ' '.join(written.split())
+
+    return ''.join(letter for at, letter in enumerate(written)
+                   if not (letter == ' ' and _is_cjk(written[at - 1]) and _is_cjk(written[at + 1])))
+
+
+def _is_cjk(letter: str) -> bool:
+    """
+    Whether a character is written in one of the scripts that needs no space between words.
+    """
+    return any(first <= ord(letter) <= last for first, last in CJK_RANGES)
+
+
 def _is_a_mnemonic(words: str) -> bool:
     """
     Whether a phrase is written in some BIP39 wordlist, whichever of them it turns out to be.
@@ -284,7 +364,8 @@ def _is_private_key(key: str) -> bool:
     return key_data is not None and key_data[0] == PRIVATE_KEY_MARKER
 
 
-def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False) -> BIP32:
+def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False,
+              prefer_electrum: bool = False) -> BIP32:
     """
     Try to parse an extended key, whether it is in xpub, xpriv or mnemonic format.
     """
@@ -303,6 +384,30 @@ def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False) -
             return public_key
         except Exception:
             pass
+
+    electrum_version = _electrum_version_of(key)
+
+    # The version Electrum reads out of a phrase is not a checksum of belonging: about one BIP39
+    # phrase in two hundred lands on one of its prefixes by chance. When a phrase reads as both,
+    # it is taken as BIP39, which is the wallet far more of them come from, and it is said out
+    # loud rather than decided quietly
+    if electrum_version is not None and not prefer_electrum and _checksum_matches(key):
+        print('⚠️  These words read as an Electrum seed phrase as well, which is another wallet')
+        print('    entirely. Taking them as BIP39; pass `--electrum` to take them as Electrum\'s')
+        electrum_version = None
+
+    if electrum_version in ELECTRUM_TWO_FACTOR_VERSIONS:
+        raise ValueError(
+            'That is an Electrum two-factor seed phrase. The words do hold the funds: they carry '
+            'two of the three keys of that wallet, which is enough to spend from it. What they '
+            'need is a two-of-three multisig, which this tool cannot build. Electrum restores it '
+            'from these same words.'
+        )
+
+    if electrum_version is not None:
+        private_key = BIP32.from_seed(_electrum_seed(key, passphrase))
+        print('🔑  Read Electrum seed phrase successfully')
+        return private_key
 
     if _is_a_mnemonic(key):
         # A phrase arrives with whatever spacing the document it was copied out of had, and the
@@ -342,8 +447,9 @@ async def find_utxos(
     Connect to an electrum server and find all the UTXOs spendable by a master key.
     """
     if master_key.master_privkey is None:
-        print('⛔️  Every derivation path this knows of starts at a hardened level, and a public key')
-        print('    cannot derive those. Recovering from an xpub needs the private key for now')
+        print('⛔️  Sweeping from a public key is not supported yet: of the paths this knows, all')
+        print('    but the Electrum ones start at a hardened level, which a public key cannot')
+        print('    derive. Re-run with the private key')
         return
 
     if not insecure and server.protocols != {'s'}:
