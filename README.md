@@ -10,10 +10,13 @@ You can use Indy to sweep all the funds to a destination address of your choice.
 
 ## Features
 
-* Supports sweeping funds from mnemonics and xprivs (an xpub is read, but every derivation path
-  known here starts at a hardened level, which a public key cannot derive)
+* Supports sweeping funds from mnemonics and xprivs (an xpub is read, but not yet swept from:
+  all the paths here but the Electrum ones start at a hardened level, which a public key
+  cannot derive)
 * Supports mnemonics in Chinese, Czech, English, French, Italian, Japanese, Korean,
   Portuguese, Russian, Spanish and Turkish
+* Supports Electrum seed phrases, standard and segwit, which are not BIP39 and derive a
+  different wallet from the same words
 * Supports all the derivation paths and address types from the wallets listed in [walletsrecovery.org](https://walletsrecovery.org/)
 * Supports customizing the address gap limit and the account gap limit
 * Supports using a custom electrum server
@@ -50,7 +53,8 @@ same way.
 
 ```
 usage: indy.py [-h] [--passphrase <pass> | --ask-passphrase]
-               [--allow-invalid-checksum] [--address <address>] [--broadcast]
+               [--allow-invalid-checksum] [--electrum] [--address <address>]
+               [--broadcast]
                [--fee-rate <rate>] [--allow-high-fee] [--yes]
                [--address-gap <num>] [--account-gap <num>] [--host <host>]
                [--port <port>] [--protocol {t,s}] [--no-batching] [--insecure]
@@ -72,6 +76,8 @@ options:
   --allow-invalid-checksum
                         derive from a mnemonic whose BIP39 checksum does not
                         match
+  --electrum            read the phrase as Electrum's when it reads as BIP39
+                        as well
 
 sweep transaction:
   --address <address>   craft a transaction sending all funds to this address

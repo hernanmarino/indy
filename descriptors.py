@@ -25,6 +25,10 @@ descriptors = {
     "m/84'/0'/a'/0/i": [ScriptType.SEGWIT],  # BIP84, external
     "m/84'/0'/a'/1/i": [ScriptType.SEGWIT],  # BIP84, change
     "m/0'/0'/i'": [ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.SEGWIT],  # Bitcoin Core
+    # Electrum hangs the addresses of a standard wallet right off the master key. Its segwit
+    # wallets sit at m/0', which the two rows below already reach
+    'm/0/i': [ScriptType.LEGACY],  # Electrum standard, external
+    'm/1/i': [ScriptType.LEGACY],  # Electrum standard, change
     "m/0'/0/i": [ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.SEGWIT],  # BRD/Hodl/Coin/Multibit external
     "m/0'/1/i": [ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.SEGWIT],  # BRD/Hodl/Coin/Multibit change
     "m/44'/0'/2147483647'/0/i": [ScriptType.LEGACY],  # Samourai ricochet, BIP44, external
