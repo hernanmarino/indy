@@ -323,6 +323,17 @@ class TestScriptIterator(unittest.TestCase):
         self.assertTrue(result['terminated'])
         self.assertEqual(result['found'], [])
 
+    def test_the_paths_an_electrum_standard_wallet_uses_are_scanned(self) -> None:
+        # Electrum hangs the addresses of a standard wallet right off the master key, with no
+        # purpose or account level in between
+        for chain in [0, 1]:
+            with self.subTest(chain=chain):
+                address = f'm/{chain}/0'
+                result = _scan({(address, 'LEGACY')}, batch_size=MAX_BATCH_SIZE, max_scripts=5_000)
+
+                self.assertTrue(result['terminated'])
+                self.assertEqual(result['found'], [(address, 'LEGACY')])
+
     def test_no_address_is_derived_twice_under_the_same_script_type(self) -> None:
         # Two descriptors that resolve alike would look the same address up twice over
         iterator = ScriptIterator(_master_key(), 20, 0)
