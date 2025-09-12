@@ -22,8 +22,11 @@ from connectrum.svr_info import ServerInfo
 from mnemonic import Mnemonic
 
 import indy
+import descriptors
 import scanner
+import transactions
 from descriptors import Path
+from tests.test_scanner import _transaction_paying
 from indy import MAX_FEE_RATE
 from scripts import ScriptType
 
@@ -862,39 +865,99 @@ class TestPublicKeyScan(unittest.TestCase):
     What a recovery does when all it was given is a public key.
     """
 
-    def _run(self) -> Tuple[str, List[object]]:
+    def _run(self, used: Optional[str] = None) -> Tuple[str, List[str]]:
         """
-        Run a scan from the public key of the test vector, recording any connection attempt.
+        Scan from the public key of the test vector, recording every address asked about.
         """
-        connections: List[object] = []
+        public = BIP32.from_xpub(BIP32_TEST_XPUB)
+        asked: List[str] = []
+        program = used and ScriptType.SEGWIT.build_output_script(
+            public.get_pubkey_from_path(Path(used).to_list()))
+        used_hash = used and scanner._electrum_script_hash(program)
+        paying = used and _transaction_paying([(100_000, program)])
+        unspent = used and {'tx_hash': transactions.read_transaction(bytes.fromhex(paying))[0],
+                            'tx_pos': 0, 'value': 100_000}
+
+        class FakeClient:
+            """
+            Electrum server that answers for one address and records what it is asked.
+            """
+
+            def __init__(self, **kwargs: object) -> None:
+                pass
+
+            async def connect(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            async def RPC(self, method: str, *params: object) -> object:
+                return self._answer(method, params[0])
+
+            async def batch_rpc(self, requests: List[Tuple[str, ...]]) -> object:
+                return [self._answer(method, at) for method, at in requests]
+
+            def _answer(self, method: str, at: str) -> object:
+                if method == 'blockchain.transaction.get':
+                    return paying
+
+                if method == 'blockchain.scripthash.get_history':
+                    asked.append(at)
+
+                if at != used_hash:
+                    return []
+
+                if method == 'blockchain.scripthash.get_history':
+                    return [{'tx_hash': unspent['tx_hash'], 'height': 700_000}]
+
+                return [unspent]
+
+            def close(self) -> None:
+                pass
+
         output = io.StringIO()
 
-        def client(**kwargs: object) -> object:
-            connections.append(kwargs)
-            raise AssertionError('The scan reached the network with nothing it could look up')
+        with mock.patch.object(indy, 'StratumClient', FakeClient):
+            with redirect_stdout(output), redirect_stderr(io.StringIO()):
+                asyncio.run(indy.find_utxos(TEST_SERVER, public, 20, 0, None, None, False, True))
 
-        with mock.patch.object(indy, 'StratumClient', client):
-            with redirect_stdout(output):
-                asyncio.run(indy.find_utxos(TEST_SERVER, BIP32.from_xpub(BIP32_TEST_XPUB),
-                                            20, 0, None, None, False, True))
+        return output.getvalue(), asked
 
-        return output.getvalue(), connections
+    def test_a_public_key_now_reaches_the_server(self) -> None:
+        # It used to be turned away before connecting, which left an exported account key
+        # with nowhere to go
+        _, asked = self._run()
 
-    def test_a_public_key_is_turned_down_before_any_server_is_reached(self) -> None:
-        _, connections = self._run()
+        self.assertTrue(asked)
 
-        self.assertEqual(connections, [])
+    def test_it_asks_about_nothing_it_could_not_have_derived(self) -> None:
+        # The addresses of the hardened paths belong to the same wallet, and a public key
+        # cannot reach them: asking about them would mean deriving them some other way
+        private = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+        _, asked = self._run()
 
-    def test_the_reason_names_what_stands_in_the_way(self) -> None:
+        out_of_reach = {scanner._electrum_script_hash(script_type.build_output_script(
+            private.get_pubkey_from_path(Path(path.replace('a', '0').replace('i', '0')).to_list())))
+            for path, types in descriptors.descriptors.items() if "'" in path
+            for script_type in types}
+
+        self.assertTrue(asked)
+        self.assertEqual(set(asked) & out_of_reach, set())
+
+    def test_what_hangs_under_the_key_is_found(self) -> None:
+        output, _ = self._run(used='m/0/0')
+
+        self.assertIn('Found used addresses', output)
+
+    def test_it_says_a_sweep_needs_the_private_key(self) -> None:
+        # The funds are there and reported; what a public key cannot do is spend them
+        output, _ = self._run(used='m/0/0')
+
+        self.assertIn('Total spendable balance found: 100000', output)
+        self.assertIn('Re-run with a private key', output)
+
+    def test_nothing_is_claimed_when_nothing_is_there(self) -> None:
         output, _ = self._run()
 
-        self.assertIn('hardened', output)
-        self.assertIn('private key', output)
-
-    def test_no_funds_are_claimed_either_way(self) -> None:
-        output, _ = self._run()
-
-        self.assertNotIn('Didn\'t find any unspent outputs', output)
+        self.assertIn('Didn\'t find any unspent outputs', output)
 
 
 class TestServerList(unittest.TestCase):

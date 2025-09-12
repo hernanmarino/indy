@@ -447,10 +447,8 @@ async def find_utxos(
     Connect to an electrum server and find all the UTXOs spendable by a master key.
     """
     if master_key.master_privkey is None:
-        print('⛔️  Sweeping from a public key is not supported yet: of the paths this knows, all')
-        print('    but the Electrum ones start at a hardened level, which a public key cannot')
-        print('    derive. Re-run with the private key')
-        return
+        print('🔍  A public key reaches only the addresses right under it, which is where an')
+        print('    exported account key keeps them. Nothing can be swept without the private key')
 
     if not insecure and server.protocols != {'s'}:
         print('⛔️  That server would be reached over plain TCP, putting every address this looks up')
@@ -473,6 +471,11 @@ async def find_utxos(
 
     balance = sum([utxo.amount_in_sat for utxo in utxos])
     print(f'💸  Total spendable balance found: {balance} sats')
+
+    if master_key.master_privkey is None:
+        print('✍️  Re-run with a private key to create a sweep transaction')
+        client.close()
+        return
 
     if address is None:
         print('ℹ️   Re-run with `--address` to create a sweep transaction')

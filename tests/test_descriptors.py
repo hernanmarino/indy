@@ -346,6 +346,35 @@ class TestScriptIterator(unittest.TestCase):
                     self.assertTrue(result['terminated'])
                     self.assertEqual(result['found'], [(address, script_type)])
 
+    def test_a_public_key_walks_the_paths_it_can_derive(self) -> None:
+        # A hardened level cannot be derived from a public key, so those paths are left out
+        # rather than walked into an error
+        public = BIP32.from_xpub(_master_key().get_master_xpub())
+        iterator = ScriptIterator(public, 20, 0)
+
+        for descriptor in iterator.descriptors:
+            with self.subTest(path=descriptor.path.path):
+                self.assertNotIn("'", descriptor.path.path)
+
+    def test_a_public_key_reaches_the_addresses_under_it(self) -> None:
+        public = BIP32.from_xpub(_master_key().get_master_xpub())
+        iterator = ScriptIterator(public, 20, 0)
+        derived = set()
+
+        while True:
+            script = iterator.next_script()
+            if script is None:
+                break
+            derived.add((script.full_path().path, script.type().name))
+
+        for chain in [0, 1]:
+            for script_type in ['LEGACY', 'COMPAT', 'SEGWIT']:
+                self.assertIn((f'm/{chain}/0', script_type), derived)
+
+    def test_a_private_key_still_walks_all_of_them(self) -> None:
+        self.assertGreater(len(ScriptIterator(_master_key(), 20, 0).descriptors),
+                           len(ScriptIterator(BIP32.from_xpub(_master_key().get_master_xpub()), 20, 0).descriptors))
+
     def test_no_address_is_derived_twice_under_the_same_script_type(self) -> None:
         # Two descriptors that resolve alike would look the same address up twice over
         iterator = ScriptIterator(_master_key(), 20, 0)

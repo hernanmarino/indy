@@ -60,6 +60,12 @@ class Path:
         """
         return self.path.find('a') >= 0
 
+    def has_hardened_levels(self) -> bool:
+        """
+        Whether any level of this path is hardened, which only a private key can derive.
+        """
+        return self.path.find("'") >= 0
+
     def has_variable_index(self) -> bool:
         """
         Whether this path has the index level as a free variable.
@@ -278,6 +284,11 @@ class ScriptIterator:
         self.descriptors = []
         self.last_descriptor = None
         for path, types in descriptors.items():
+            # A public key derives no hardened level, so those paths are left out rather than
+            # walked into the failure of deriving one
+            if master_key.master_privkey is None and Path(path).has_hardened_levels():
+                continue
+
             for type in types:
                 self.descriptors.append(DescriptorScriptIterator(Path(path), type, address_gap, account_gap))
 
