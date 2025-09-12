@@ -15,7 +15,7 @@ from typing import List, Optional
 import base58
 import coincurve
 import connectrum
-from bip32 import BIP32
+from bip32 import BIP32, HARDENED_INDEX
 from connectrum.client import StratumClient
 from connectrum.svr_info import ServerInfo
 from mnemonic import Mnemonic
@@ -29,6 +29,22 @@ ELECTRUM_PROTOCOL_VERSIONS = ['1.4', '1.4.2']
 
 SATOSHIS_PER_BITCOIN = 10 ** 8
 BYTES_PER_KILOBYTE = 1_000
+
+# What SLIP-132 writes a mainnet key as, none of which the library knows for mainnet
+SLIP132_MAINNET_VERSIONS = [0x049d_7cb2, 0x049d_7878, 0x04b2_4746, 0x04b2_430c,
+                            0x0295_b43f, 0x0295_b005, 0x02aa_7ed3, 0x02aa_7a99]
+
+# Every way a mainnet key is written. This tool asks mainnet servers, builds mainnet addresses
+# and counts BIP48 from the mainnet coin type, so a key of any other chain has no place in it
+MAINNET_VERSIONS = [0x0488_b21e, 0x0488_ade4] + SLIP132_MAINNET_VERSIONS
+VERSION_LENGTH_IN_BYTES = 4
+
+# The branches BIP48 puts a multisig under, by the script type each one spends to
+BIP48_PURPOSE = 48
+MULTISIG_BRANCHES = [(1, 'P2SH-P2WSH'), (2, 'P2WSH')]
+
+# Only a key that is a root has the levels BIP48 counts from under it
+ROOT_DEPTH = 0
 
 # Electrum writes its phrases with the same words as BIP39 and tells its own apart by a version
 # it works out of them. The two kinds it makes today are a standard wallet and a segwit one; the
@@ -67,13 +83,14 @@ MAX_FEE_SHARE_OF_BALANCE = 0.10
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Find and sweep all the funds from a mnemonic or bitcoin key, regardless of the derivation path or '
-                    'address format used.'
+        description='Find and sweep the funds of a mnemonic or bitcoin key, across the derivation paths and address '
+                    'formats the wallets known here are used with.'
     )
 
     parser.add_argument('key', nargs='?', default=None,
-                        help='master key to sweep, formats: mnemonic, xpriv or xpub '
-                             '(asked for out of sight if left off)')
+                        help='key to search, and to sweep when it is private: mnemonic, xpriv '
+                             'or xpub, the root one or an account (asked for out of sight if '
+                             'left off)')
     passphrase_source = parser.add_mutually_exclusive_group()
     passphrase_source.add_argument('--passphrase', metavar='<pass>', default='',
                                    help='optional secret phrase necessary to decode the mnemonic')
@@ -83,6 +100,9 @@ def main():
                         help='derive from a mnemonic whose BIP39 checksum does not match')
     parser.add_argument('--electrum', default=False, action='store_true',
                         help='read the phrase as Electrum\'s when it reads as BIP39 as well')
+    parser.add_argument('--show-multisig-keys', default=False, action='store_true',
+                        help='print the BIP48 keys a private root holds, which reveal the '
+                             'addresses of that branch to whoever reads them')
 
     sweep_tx = parser.add_argument_group('sweep transaction')
 
@@ -149,7 +169,8 @@ def main():
         not args.no_batching,
         args.allow_high_fee,
         args.yes,
-        args.insecure
+        args.insecure,
+        args.show_multisig_keys
     ))
 
 
@@ -237,6 +258,32 @@ def _read_passphrase(given: str, should_ask: bool) -> str:
         _warn_about_the_command_line()
 
     return given
+
+
+def _is_of_another_chain(key: str) -> bool:
+    """
+    Whether an extended key is written for a chain other than the one this searches.
+    """
+    return _key_data(key) is not None and _version_of(key) not in MAINNET_VERSIONS
+
+
+def _on_mainnet(key: BIP32, written: str) -> BIP32:
+    """
+    Read a key written under a SLIP-132 prefix as the mainnet key it is.
+    """
+    # The library calls a key testnet unless it was spelled xprv or xpub, so a zprv would
+    # otherwise hand back keys that read tpub
+    if _version_of(written) in SLIP132_MAINNET_VERSIONS:
+        key.network = 'main'
+
+    return key
+
+
+def _version_of(key: str) -> int:
+    """
+    The version bytes an extended key is written under, which name its chain and script type.
+    """
+    return int.from_bytes(base58.b58decode_check(key)[:VERSION_LENGTH_IN_BYTES], 'big')
 
 
 def _electrum_version_of(words: str) -> Optional[str]:
@@ -369,19 +416,26 @@ def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False,
     """
     Try to parse an extended key, whether it is in xpub, xpriv or mnemonic format.
     """
+    if _is_of_another_chain(key):
+        raise ValueError(
+            'That key belongs to another chain: its prefix is not one of the ways a mainnet key '
+            'is written. This looks up mainnet addresses on mainnet servers, so it has nowhere '
+            'to search for it.'
+        )
+
     if _is_private_key(key):
         try:
             private_key = BIP32.from_xpriv(key)
-            print('🔑  Read master private key successfully')
-            return private_key
+            print('🔑  Read private key successfully')
+            return _on_mainnet(private_key, key)
         except Exception:
             pass
 
     if _is_public_key(key):
         try:
             public_key = BIP32.from_xpub(key)
-            print('🔑  Read master public key successfully')
-            return public_key
+            print('🔑  Read public key successfully')
+            return _on_mainnet(public_key, key)
         except Exception:
             pass
 
@@ -430,6 +484,40 @@ def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False,
     raise ValueError('The key is invalid or the format isn\'t recognized. Make sure it\'s a mnemonic, xpriv or xpub.')
 
 
+def _report_multisig_keys(master_key: BIP32, should_show_keys: bool) -> None:
+    """
+    Say what a multisig of this seed would take, and hand over its keys if they were asked for.
+    """
+    print()
+    print('🔑  A multisig wallet cannot be searched for from one seed: its addresses are built')
+    print('    from every cosigner at once, so this scan says nothing either way about one.')
+
+    # What this key can give comes before what was asked of it: offering a flag that would
+    # answer with an excuse is worse than saying the excuse now
+    if master_key.master_privkey is None:
+        print('    Its keys hang off levels a public key cannot derive: that takes the seed')
+        print('    phrase or the root xpriv')
+        return
+
+    if master_key.depth != ROOT_DEPTH:
+        print(f'    BIP48 counts its levels from the root, and this key is {master_key.depth} under one, so')
+        print('    its keys take the seed phrase or the root xpriv')
+        return
+
+    if not should_show_keys:
+        print('    Pass `--show-multisig-keys` for the keys this seed holds under BIP48')
+        return
+
+    print('    What is missing is the other cosigners\' keys and how many must sign, plus:')
+
+    for branch, script_type in MULTISIG_BRANCHES:
+        path = [BIP48_PURPOSE + HARDENED_INDEX, HARDENED_INDEX, HARDENED_INDEX,
+                branch + HARDENED_INDEX]
+        spelled = f'm/{BIP48_PURPOSE}\'/0\'/0\'/{branch}\''
+
+        print(f'    {spelled}  {script_type:10}  {master_key.get_xpub_from_path(path)}')
+
+
 async def find_utxos(
         server: ServerInfo,
         master_key: BIP32,
@@ -441,10 +529,11 @@ async def find_utxos(
         should_batch: bool,
         allow_high_fee: bool = False,
         assume_yes: bool = False,
-        insecure: bool = False
+        insecure: bool = False,
+        show_multisig_keys: bool = False
 ):
     """
-    Connect to an electrum server and find all the UTXOs spendable by a master key.
+    Connect to an electrum server and find every UTXO a key reaches, spendable or not.
     """
     if master_key.master_privkey is None:
         print('🔍  A public key reaches only the addresses right under it, which is where an')
@@ -466,8 +555,11 @@ async def find_utxos(
 
     if len(utxos) == 0:
         print('😔  Didn\'t find any unspent outputs')
+        _report_multisig_keys(master_key, show_multisig_keys)
         client.close()
         return
+
+    _report_multisig_keys(master_key, show_multisig_keys)
 
     balance = sum([utxo.amount_in_sat for utxo in utxos])
     print(f'💸  Total spendable balance found: {balance} sats')
