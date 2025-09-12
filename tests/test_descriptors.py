@@ -334,6 +334,18 @@ class TestScriptIterator(unittest.TestCase):
                 self.assertTrue(result['terminated'])
                 self.assertEqual(result['found'], [(address, 'LEGACY')])
 
+    def test_the_paths_under_a_key_of_its_own_carry_every_script_type(self) -> None:
+        # What a wallet exports is the key of its account, and its addresses hang off that at
+        # m/0/i and m/1/i whichever script type it spends to
+        for chain in [0, 1]:
+            for script_type in ['LEGACY', 'COMPAT', 'SEGWIT']:
+                with self.subTest(chain=chain, script_type=script_type):
+                    address = f'm/{chain}/0'
+                    result = _scan({(address, script_type)}, batch_size=MAX_BATCH_SIZE, max_scripts=6_000)
+
+                    self.assertTrue(result['terminated'])
+                    self.assertEqual(result['found'], [(address, script_type)])
+
     def test_no_address_is_derived_twice_under_the_same_script_type(self) -> None:
         # Two descriptors that resolve alike would look the same address up twice over
         iterator = ScriptIterator(_master_key(), 20, 0)
