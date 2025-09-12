@@ -10,14 +10,16 @@ You can use Indy to sweep all the funds to a destination address of your choice.
 
 ## Features
 
-* Supports sweeping funds from mnemonics and xprivs (an xpub is read, but not yet swept from:
-  all the paths here but the Electrum ones start at a hardened level, which a public key
-  cannot derive)
+* Supports sweeping funds from mnemonics and xprivs, and finding them from an xpub: what a
+  wallet exports is the key of an account, and its addresses hang right under it. Spending
+  them still takes the private key
 * Supports mnemonics in Chinese, Czech, English, French, Italian, Japanese, Korean,
   Portuguese, Russian, Spanish and Turkish
 * Supports Electrum seed phrases, standard and segwit, which are not BIP39 and derive a
   different wallet from the same words
-* Supports all the derivation paths and address types from the wallets listed in [walletsrecovery.org](https://walletsrecovery.org/)
+* Supports the derivation paths and address types of most single key wallets listed in
+  [walletsrecovery.org](https://walletsrecovery.org/), taproot (BIP86) aside. Multisig (BIP48)
+  is not searched for at all
 * Supports customizing the address gap limit and the account gap limit
 * Supports using a custom electrum server
 
@@ -31,7 +33,15 @@ Indy uses electrum servers to try [every possible combination](https://github.co
 
 Some wallets use a custom address gap limit (or none at all), or really high account numbers, so you can choose to override these parameters.
 
-Finally, notice that this tool is only useful for single key wallets. If you are using a multisig or lightning wallet, then you cannot recover the funds with just the mnemonic.
+Finally, notice that this tool is only useful for single key wallets. If you are using a
+multisig or lightning wallet, then you cannot recover the funds with just the mnemonic.
+
+A multisig cannot even be searched for: its addresses are built from every cosigner at once,
+so one seed derives none of them, and every scan says as much. Recovering one takes the keys
+BIP48 puts that wallet under, the other cosigners' keys, and how many of them must sign.
+`--show-multisig-keys` prints the first of those, which only a private root holds. They are
+kept back otherwise: an xpub spends nothing, but it hands every address of that branch to
+whoever reads it.
 
 ## Installation
 ```
@@ -53,18 +63,19 @@ same way.
 
 ```
 usage: indy.py [-h] [--passphrase <pass> | --ask-passphrase]
-               [--allow-invalid-checksum] [--electrum] [--address <address>]
-               [--broadcast]
+               [--allow-invalid-checksum] [--electrum] [--show-multisig-keys]
+               [--address <address>] [--broadcast]
                [--fee-rate <rate>] [--allow-high-fee] [--yes]
                [--address-gap <num>] [--account-gap <num>] [--host <host>]
                [--port <port>] [--protocol {t,s}] [--no-batching] [--insecure]
                [key]
 
-Find and sweep all the funds from a mnemonic or bitcoin key, regardless of the
-derivation path or address format used.
+Find and sweep the funds of a mnemonic or bitcoin key, across the derivation
+paths and address formats the wallets that use them are known to.
 
 positional arguments:
-  key                   master key to sweep, formats: mnemonic, xpriv or xpub
+  key                   key to search, and to sweep when it is private:
+                        mnemonic, xpriv or xpub, the root one or an account
                         (asked for out of sight if left off)
 
 options:
@@ -78,6 +89,8 @@ options:
                         match
   --electrum            read the phrase as Electrum's when it reads as BIP39
                         as well
+  --show-multisig-keys  print the BIP48 keys a private root holds, which reveal
+                        the addresses of that branch to whoever reads them
 
 sweep transaction:
   --address <address>   craft a transaction sending all funds to this address

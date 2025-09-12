@@ -22,8 +22,11 @@ from connectrum.svr_info import ServerInfo
 from mnemonic import Mnemonic
 
 import indy
+import descriptors
 import scanner
+import transactions
 from descriptors import Path
+from tests.test_scanner import _transaction_paying
 from indy import MAX_FEE_RATE
 from scripts import ScriptType
 
@@ -38,6 +41,14 @@ BIP32_TEST_ZPRV = ('zprvAWgYBBk7JR8GjzqSzmunMCS7dAbwpYTCs1YUMDXqduMA5JFHZ3iX5s2U
                    'BdcCYYa1S5o1fVLrKsrnpCQ4WpUd6aVUWP1bS2Yy5DoaKv')
 BIP32_TEST_ZPUB = ('zpub6jftahH18ngZxUuv6oSniLNrBCSSE1B4EEU59bwTCEt8x6aS6b2mdfLxbS4QS'
                    '53g85SWWP6wexqeer516433gYpZQoJie2tcMYdJ1SYYYAL')
+
+# The purposes these tests derive under, named here rather than shared with the code they check
+BIP48_PURPOSE = 48
+BIP84_PURPOSE = 84
+
+# The same key under the testnet prefix, which is a testnet key and not another spelling
+BIP32_TEST_TPRV = ('tprv8ZgxMBicQKsPeDgjzdC36fs6bMjGApWDNLR9erAXMs5skhMv36j9MV5ecvfav'
+                   'ji5khqjWaWSFhN3YcCUUdiKH6isR4Pwy3U5y5egddBr16m')
 
 # That same public key with its key data marked 0x01 and 0xff, neither of which is a point parity
 BIP32_TEST_XPUB_MARKED_01 = ('xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gYxFk5'
@@ -498,6 +509,29 @@ class TestKeyParsing(unittest.TestCase):
         self.assertIn('two of the three keys', refusal)
         self.assertIn('electrum restores it', refusal)
 
+    def test_a_key_of_another_chain_is_refused(self) -> None:
+        # SLIP-132 is mainnet written another way; a testnet prefix is another chain. Reading
+        # one here would look up mainnet addresses and count BIP48 from the mainnet coin type
+        with self.assertRaises(ValueError) as refused:
+            self._parse(BIP32_TEST_TPRV)
+
+        self.assertIn('chain', str(refused.exception).lower())
+
+    def test_the_mainnet_spellings_are_all_taken(self) -> None:
+        # The ten ways a mainnet key is written, spelled out here rather than read from the
+        # code that has to know them
+        private_versions = ['0488ade4', '049d7878', '04b2430c', '0295b005', '02aa7a99']
+        public_versions = ['0488b21e', '049d7cb2', '04b24746', '0295b43f', '02aa7ed3']
+
+        for versions, key in [(private_versions, BIP32_TEST_XPRIV), (public_versions, BIP32_TEST_XPUB)]:
+            payload = base58.b58decode_check(key)[4:]
+
+            for version in versions:
+                spelled = base58.b58encode_check(bytes.fromhex(version) + payload).decode()
+
+                with self.subTest(version=version):
+                    self.assertIsNotNone(self._parse(spelled))
+
     def test_something_that_is_no_kind_of_key_is_refused(self) -> None:
         with self.assertRaises(ValueError):
             self._parse('not a key at all')
@@ -538,7 +572,7 @@ class TestSecretInput(unittest.TestCase):
         output, prompts, _ = self._run(['--host', 'example.invalid'], typed=[BIP32_TEST_XPRIV])
 
         self.assertEqual(len(prompts), 1)
-        self.assertIn('Read master private key', output)
+        self.assertIn('Read private key', output)
 
     def test_a_secret_on_the_command_line_still_works_but_is_warned_about(self) -> None:
         output, prompts, _ = self._run([TestKeyParsing.VALID, '--host', 'example.invalid'])
@@ -611,6 +645,22 @@ class TestSecretInput(unittest.TestCase):
         with self.assertRaises(SystemExit):
             with redirect_stderr(io.StringIO()):
                 self._run([BIP32_TEST_XPRIV, '--passphrase', 'one', '--ask-passphrase'])
+
+    def test_asking_for_the_multisig_keys_reaches_the_scan(self) -> None:
+        # Wiring a flag and reading it are two things, and the default here is the private one
+        _, _, without = self._run([BIP32_TEST_XPRIV, '--host', 'example.invalid'])
+        _, _, with_them = self._run([BIP32_TEST_XPRIV, '--show-multisig-keys',
+                                     '--host', 'example.invalid'])
+
+        self.assertEqual(without[-1], False)
+        self.assertEqual(with_them[-1], True)
+
+    def test_reading_a_phrase_as_electrum_reaches_the_derivation(self) -> None:
+        with redirect_stdout(io.StringIO()):
+            _, _, arguments = self._run([COLLIDING_PHRASE, '--electrum', '--host', 'example.invalid'])
+            as_electrum = indy.parse_key(COLLIDING_PHRASE, '', prefer_electrum=True)
+
+        self.assertEqual(arguments[1].master_privkey, as_electrum.master_privkey)
 
     def test_the_checksum_override_reaches_the_derivation(self) -> None:
         broken = TestKeyParsing.BROKEN_CHECKSUM
@@ -862,39 +912,258 @@ class TestPublicKeyScan(unittest.TestCase):
     What a recovery does when all it was given is a public key.
     """
 
-    def _run(self) -> Tuple[str, List[object]]:
+    def _run(self, used: Optional[str] = None,
+             key: Optional[BIP32] = None) -> Tuple[str, List[str]]:
         """
-        Run a scan from the public key of the test vector, recording any connection attempt.
+        Scan from a public key, recording every address it asks the server about.
         """
-        connections: List[object] = []
+        public = key or BIP32.from_xpub(BIP32_TEST_XPUB)
+        asked: List[str] = []
+        program = used and ScriptType.SEGWIT.build_output_script(
+            public.get_pubkey_from_path(Path(used).to_list()))
+        used_hash = used and scanner._electrum_script_hash(program)
+        paying = used and _transaction_paying([(100_000, program)])
+        unspent = used and {'tx_hash': transactions.read_transaction(bytes.fromhex(paying))[0],
+                            'tx_pos': 0, 'value': 100_000}
+
+        class FakeClient:
+            """
+            Electrum server that answers for one address and records what it is asked.
+            """
+
+            def __init__(self, **kwargs: object) -> None:
+                pass
+
+            async def connect(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            async def RPC(self, method: str, *params: object) -> object:
+                return self._answer(method, params[0])
+
+            async def batch_rpc(self, requests: List[Tuple[str, ...]]) -> object:
+                return [self._answer(method, at) for method, at in requests]
+
+            def _answer(self, method: str, at: str) -> object:
+                if method == 'blockchain.transaction.get':
+                    return paying
+
+                if method == 'blockchain.scripthash.get_history':
+                    asked.append(at)
+
+                if at != used_hash:
+                    return []
+
+                if method == 'blockchain.scripthash.get_history':
+                    return [{'tx_hash': unspent['tx_hash'], 'height': 700_000}]
+
+                return [unspent]
+
+            def close(self) -> None:
+                pass
+
         output = io.StringIO()
 
-        def client(**kwargs: object) -> object:
-            connections.append(kwargs)
-            raise AssertionError('The scan reached the network with nothing it could look up')
+        with mock.patch.object(indy, 'StratumClient', FakeClient):
+            with redirect_stdout(output), redirect_stderr(io.StringIO()):
+                asyncio.run(indy.find_utxos(TEST_SERVER, public, 20, 0, None, None, False, True))
 
-        with mock.patch.object(indy, 'StratumClient', client):
+        return output.getvalue(), asked
+
+    def test_the_account_key_a_wallet_exports_finds_its_own_addresses(self) -> None:
+        # This is what the feature is for: not a master xpub, which no wallet hands out, but
+        # the key of an account, three levels down, with its addresses right under it
+        private = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+        account = BIP32.from_xpub(private.get_xpub_from_path([BIP84_PURPOSE + HARDENED_INDEX,
+                                                              HARDENED_INDEX, HARDENED_INDEX]))
+
+        self.assertEqual(account.depth, 3)
+
+        output, _ = self._run(used='m/0/0', key=account)
+
+        self.assertIn('Found used addresses', output)
+        self.assertIn('Total spendable balance found: 100000', output)
+
+    def test_what_it_reaches_there_is_what_the_whole_seed_would(self) -> None:
+        private = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+        account_path = [BIP84_PURPOSE + HARDENED_INDEX, HARDENED_INDEX, HARDENED_INDEX]
+        account = BIP32.from_xpub(private.get_xpub_from_path(account_path))
+
+        self.assertEqual(account.get_pubkey_from_path([0, 0]),
+                         private.get_pubkey_from_path(account_path + [0, 0]))
+
+    def test_a_public_key_now_reaches_the_server(self) -> None:
+        # It used to be turned away before connecting, which left an exported account key
+        # with nowhere to go
+        _, asked = self._run()
+
+        self.assertTrue(asked)
+
+    def test_it_asks_about_nothing_it_could_not_have_derived(self) -> None:
+        # The addresses of the hardened paths belong to the same wallet, and a public key
+        # cannot reach them: asking about them would mean deriving them some other way
+        private = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+        _, asked = self._run()
+
+        out_of_reach = {scanner._electrum_script_hash(script_type.build_output_script(
+            private.get_pubkey_from_path(Path(path.replace('a', '0').replace('i', '0')).to_list())))
+            for path, types in descriptors.descriptors.items() if "'" in path
+            for script_type in types}
+
+        self.assertTrue(asked)
+        self.assertEqual(set(asked) & out_of_reach, set())
+
+    def test_what_hangs_under_the_key_is_found(self) -> None:
+        output, _ = self._run(used='m/0/0')
+
+        self.assertIn('Found used addresses', output)
+
+    def test_it_says_a_sweep_needs_the_private_key(self) -> None:
+        # The funds are there and reported; what a public key cannot do is spend them
+        output, _ = self._run(used='m/0/0')
+
+        self.assertIn('Total spendable balance found: 100000', output)
+        self.assertIn('Re-run with a private key', output)
+
+    def test_nothing_is_claimed_when_nothing_is_there(self) -> None:
+        output, _ = self._run()
+
+        self.assertIn('Didn\'t find any unspent outputs', output)
+
+
+class TestMultisigKeys(unittest.TestCase):
+    """
+    What is said about the multisig wallet a seed could be part of, and when its keys are handed
+    over, which is only when they are asked for.
+    """
+
+    def _run(self, key: BIP32, utxos: Optional[List[scanner.Utxo]] = None,
+             should_show_keys: bool = True) -> str:
+        output = io.StringIO()
+
+        class FakeClient:
+            """
+            Electrum server that connects and is never asked anything.
+            """
+
+            def __init__(self, **kwargs: object) -> None:
+                pass
+
+            async def connect(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            async def RPC(self, *args: object) -> object:
+                return []
+
+            def close(self) -> None:
+                pass
+
+        async def scan(*args: object) -> List[scanner.Utxo]:
+            return utxos or []
+
+        with mock.patch.object(indy, 'StratumClient', FakeClient), \
+             mock.patch.object(scanner, 'scan_master_key', scan):
             with redirect_stdout(output):
-                asyncio.run(indy.find_utxos(TEST_SERVER, BIP32.from_xpub(BIP32_TEST_XPUB),
-                                            20, 0, None, None, False, True))
+                asyncio.run(indy.find_utxos(TEST_SERVER, key, 20, 0, None, None, False, True,
+                                            show_multisig_keys=should_show_keys))
 
-        return output.getvalue(), connections
+        return output.getvalue()
 
-    def test_a_public_key_is_turned_down_before_any_server_is_reached(self) -> None:
-        _, connections = self._run()
+    def test_the_keys_are_kept_back_until_they_are_asked_for(self) -> None:
+        # An xpub spends nothing, but it hands over every address of that branch, past and to
+        # come, to whoever reads the screen. That is not printed unasked
+        output = self._run(BIP32.from_xpriv(BIP32_TEST_XPRIV), should_show_keys=False)
 
-        self.assertEqual(connections, [])
+        self.assertIn('multisig', output.lower())
+        self.assertIn('--show-multisig-keys', output)
+        self.assertNotIn('xpub', output)
 
-    def test_the_reason_names_what_stands_in_the_way(self) -> None:
-        output, _ = self._run()
+    def test_finding_nothing_offers_the_keys_of_a_multisig(self) -> None:
+        # A multisig cannot be searched for from one seed: its addresses take every cosigner.
+        # Handing over the keys that seed does hold turns a dead end into a next step
+        private = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+        output = self._run(private)
 
-        self.assertIn('hardened', output)
-        self.assertIn('private key', output)
+        for script in [1, 2]:
+            with self.subTest(script=script):
+                expected = private.get_xpub_from_path([BIP48_PURPOSE + HARDENED_INDEX, HARDENED_INDEX,
+                                                       HARDENED_INDEX, script + HARDENED_INDEX])
 
-    def test_no_funds_are_claimed_either_way(self) -> None:
-        output, _ = self._run()
+                self.assertIn(expected, output)
 
-        self.assertNotIn('Didn\'t find any unspent outputs', output)
+    def test_it_says_what_is_missing_to_use_them(self) -> None:
+        output = self._run(BIP32.from_xpriv(BIP32_TEST_XPRIV))
+
+        self.assertIn('multisig', output.lower())
+        self.assertIn('cosigner', output.lower())
+
+    def test_finding_something_does_not_take_the_offer_away(self) -> None:
+        # One seed can stand behind a singlesig wallet and a multisig one at once, and a small
+        # amount found in the first would otherwise bury the keys to the second
+        utxo = scanner.Utxo('ab' * 32, 0, 100_000, Path("m/84'/0'/0'/0/0"), ScriptType.SEGWIT)
+        output = self._run(BIP32.from_xpriv(BIP32_TEST_XPRIV), [utxo], should_show_keys=False)
+
+        self.assertIn('multisig', output.lower())
+
+    def test_a_key_that_is_not_a_root_is_handed_no_keys_at_all(self) -> None:
+        # BIP48 counts its levels from the root: derived under an account key those levels
+        # land somewhere else entirely, and printing them under their absolute names is a lie
+        root = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+        account = BIP32.from_xpriv(root.get_xpriv_from_path([BIP84_PURPOSE + HARDENED_INDEX, HARDENED_INDEX,
+                                                             HARDENED_INDEX]))
+        output = self._run(account)
+
+        self.assertIn('multisig', output.lower())
+        self.assertNotIn('xpub', output)
+        self.assertIn('root', output.lower())
+
+    def test_the_keys_are_mainnet_whatever_prefix_the_key_arrived_under(self) -> None:
+        # The library reads anything but xprv or xpub as testnet, and SLIP-132 is neither
+        with redirect_stdout(io.StringIO()):
+            under_slip132 = indy.parse_key(BIP32_TEST_ZPRV, '')
+
+        output = self._run(under_slip132)
+
+        self.assertIn('xpub', output)
+        self.assertNotIn('tpub', output)
+
+    def test_those_keys_are_the_ones_the_root_derives(self) -> None:
+        root = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+
+        with redirect_stdout(io.StringIO()):
+            under_slip132 = indy.parse_key(BIP32_TEST_ZPRV, '')
+
+        self.assertIn(root.get_xpub_from_path([BIP48_PURPOSE + HARDENED_INDEX, HARDENED_INDEX,
+                                               HARDENED_INDEX, 1 + HARDENED_INDEX]),
+                      self._run(under_slip132))
+
+    def test_a_key_that_cannot_give_them_is_not_offered_the_flag(self) -> None:
+        # Offering a flag that would answer with an excuse sends the user to run the whole
+        # scan again for nothing: what is missing is said the first time
+        root = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+        account = BIP32.from_xpriv(root.get_xpriv_from_path([BIP84_PURPOSE + HARDENED_INDEX,
+                                                             HARDENED_INDEX, HARDENED_INDEX]))
+
+        for key in [BIP32.from_xpub(BIP32_TEST_XPUB), account]:
+            with self.subTest(key=key.depth):
+                output = self._run(key, should_show_keys=False)
+
+                self.assertIn('root xpriv', output)
+                self.assertNotIn('--show-multisig-keys', output)
+
+    def test_a_private_root_is_the_one_offered_the_flag(self) -> None:
+        output = self._run(BIP32.from_xpriv(BIP32_TEST_XPRIV), should_show_keys=False)
+
+        self.assertIn('--show-multisig-keys', output)
+        self.assertNotIn('root xpriv', output)
+
+    def test_a_public_key_asking_for_them_is_told_why_it_gets_none(self) -> None:
+        # Asking and being answered with silence is the one thing that should not happen: the
+        # branches are hardened, and saying so is what tells the user what to re-run with
+        output = self._run(BIP32.from_xpub(BIP32_TEST_XPUB))
+
+        self.assertIn('multisig', output.lower())
+        self.assertIn('root xpriv', output)
+        self.assertNotIn('xpub6', output)
 
 
 class TestServerList(unittest.TestCase):
