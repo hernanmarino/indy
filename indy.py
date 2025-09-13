@@ -31,8 +31,8 @@ SATOSHIS_PER_BITCOIN = 10 ** 8
 BYTES_PER_KILOBYTE = 1_000
 
 # What SLIP-132 writes a mainnet key as, none of which the library knows for mainnet. The
-# capitalised four say the key belongs to a cosigner of a BIP48 multisig, which is a wallet
-# whose addresses no single key can work out
+# capitalised four say the key spends to a multisig output, which is a wallet whose addresses
+# no single key can work out. SLIP-132 names the script type, not the path it hangs from
 SLIP132_SINGLE_KEY_VERSIONS = [0x049d_7cb2, 0x049d_7878, 0x04b2_4746, 0x04b2_430c]
 SLIP132_COSIGNER_VERSIONS = [0x0295_b43f, 0x0295_b005, 0x02aa_7ed3, 0x02aa_7a99]
 SLIP132_MAINNET_VERSIONS = SLIP132_SINGLE_KEY_VERSIONS + SLIP132_COSIGNER_VERSIONS
@@ -44,7 +44,10 @@ VERSION_LENGTH_IN_BYTES = 4
 
 # The branches BIP48 puts a multisig under, by the script type each one spends to
 BIP48_PURPOSE = 48
+MAINNET_COIN_TYPE = 0
+MULTISIG_ACCOUNT = 0
 MULTISIG_BRANCHES = [(1, 'P2SH-P2WSH'), (2, 'P2WSH')]
+SCRIPT_TYPE_COLUMN = 10
 
 # Where a key sits decides what hangs under it: a root has everything below hardened levels,
 # and an account key, three down, has its addresses in the two chains right under it
@@ -106,8 +109,9 @@ def main():
     parser.add_argument('--electrum', default=False, action='store_true',
                         help='read the phrase as Electrum\'s when it reads as BIP39 as well')
     parser.add_argument('--show-multisig-keys', default=False, action='store_true',
-                        help='print the BIP48 keys a private root holds, which reveal the '
-                             'addresses of that branch to whoever reads them')
+                        help='print the BIP48 keys of account 0 that a private root holds, '
+                             'which reveal the addresses of those branches to whoever reads '
+                             'them')
 
     sweep_tx = parser.add_argument_group('sweep transaction')
 
@@ -267,7 +271,7 @@ def _read_passphrase(given: str, should_ask: bool) -> str:
 
 def _is_a_cosigner_key(key: str) -> bool:
     """
-    Whether an extended key is written as what a cosigner of a BIP48 multisig holds.
+    Whether an extended key is written as one that spends to a multisig output.
     """
     return _key_data(key) is not None and _version_of(key) in SLIP132_COSIGNER_VERSIONS
 
@@ -456,11 +460,11 @@ def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False,
 
     if _is_a_cosigner_key(key):
         raise ValueError(
-            'That is the account key of a multisig cosigner: its prefix is one of the four '
-            'SLIP-132 spellings that say so. The addresses of that wallet are built from the '
-            'keys of every cosigner and the number of them that must sign, so this one alone '
-            'derives none of them and there is nothing here to search for. Recovering it takes '
-            'a wallet that can put the cosigners back together.'
+            'That is the key of a multisig cosigner: its prefix is one of the four SLIP-132 '
+            'spellings that say the output is a multisig one. The addresses of that wallet are '
+            'built from the keys of every cosigner and the number of them that must sign, so '
+            'this one alone derives none of them and there is nothing here to search for. '
+            'Recovering it takes a wallet that can put the cosigners back together.'
         )
 
     if _is_private_key(key):
@@ -538,17 +542,18 @@ def _report_what_a_public_key_reaches(master_key: BIP32) -> None:
     """
     Say which of the paths a public key can walk, which depends on where the key sits.
     """
-    print('🔍  A public key reaches only the addresses right under it, and nothing below a')
+    print('🔍  A public key reaches only the two chains right under it, and nothing below a')
     print('    hardened level. Nothing can be swept without the private key either')
 
-    if master_key.depth != ROOT_DEPTH:
+    if master_key.depth == ACCOUNT_DEPTH:
         return
 
-    # From a root, those two paths are an Electrum standard wallet and no other: every wallet
-    # under BIP44, BIP49 or BIP84 keeps its addresses below the hardened level of an account
-    print('    This key is a root, so that is the Electrum standard wallet and nothing else.')
+    # A root is the only other key that gets here, and under one those two paths are an
+    # Electrum standard wallet: a BIP44, BIP49 or BIP84 wallet keeps its addresses below the
+    # hardened level of an account, out of reach of any public key
+    print('    This key is a root, so that is an Electrum standard wallet and nothing else')
     print('    A BIP44, BIP49 or BIP84 wallet keeps its addresses under an account: for those,')
-    print('    the account xpub is the one to bring, which is what a wallet exports')
+    print('    bring the account xpub, which is the one a wallet exports')
 
 
 def _report_multisig_keys(master_key: BIP32, should_show_keys: bool) -> None:
@@ -557,7 +562,7 @@ def _report_multisig_keys(master_key: BIP32, should_show_keys: bool) -> None:
     """
     print()
     print('🔑  A multisig wallet cannot be searched for from one seed: its addresses are built')
-    print('    from every cosigner at once, so this scan says nothing either way about one.')
+    print('    from every cosigner at once, so this scan says nothing either way about one')
 
     # What this key can give comes before what was asked of it: offering a flag that would
     # answer with an excuse is worse than saying the excuse now
@@ -572,17 +577,18 @@ def _report_multisig_keys(master_key: BIP32, should_show_keys: bool) -> None:
         return
 
     if not should_show_keys:
-        print('    Pass `--show-multisig-keys` for the keys this seed holds under BIP48')
+        print(f'    Pass `--show-multisig-keys` for the BIP48 keys of account {MULTISIG_ACCOUNT}')
         return
 
-    print('    What is missing is the other cosigners\' keys and how many must sign, plus:')
+    print('    What is missing is the other cosigners\' keys and how many must sign, along')
+    print(f'    with these, which BIP48 puts account {MULTISIG_ACCOUNT} of such a wallet under:')
 
     for branch, script_type in MULTISIG_BRANCHES:
-        path = [BIP48_PURPOSE + HARDENED_INDEX, HARDENED_INDEX, HARDENED_INDEX,
-                branch + HARDENED_INDEX]
-        spelled = f'm/{BIP48_PURPOSE}\'/0\'/0\'/{branch}\''
+        path = [BIP48_PURPOSE + HARDENED_INDEX, MAINNET_COIN_TYPE + HARDENED_INDEX,
+                MULTISIG_ACCOUNT + HARDENED_INDEX, branch + HARDENED_INDEX]
+        spelled = f"m/{BIP48_PURPOSE}'/{MAINNET_COIN_TYPE}'/{MULTISIG_ACCOUNT}'/{branch}'"
 
-        print(f'    {spelled}  {script_type:10}  {master_key.get_xpub_from_path(path)}')
+        print(f'    {spelled}  {script_type:{SCRIPT_TYPE_COLUMN}}  {master_key.get_xpub_from_path(path)}')
 
 
 async def find_utxos(
@@ -625,10 +631,10 @@ async def find_utxos(
         client.close()
         return
 
-    _report_multisig_keys(master_key, show_multisig_keys)
-
     balance = sum([utxo.amount_in_sat for utxo in utxos])
     print(f'💸  Total spendable balance found: {balance} sats')
+
+    _report_multisig_keys(master_key, show_multisig_keys)
 
     if master_key.master_privkey is None:
         print('✍️  Re-run with a private key to create a sweep transaction')

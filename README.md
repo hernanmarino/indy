@@ -39,9 +39,9 @@ multisig or lightning wallet, then you cannot recover the funds with just the mn
 A multisig cannot even be searched for: its addresses are built from every cosigner at once,
 so one seed derives none of them, and every scan says as much. Recovering one takes the keys
 BIP48 puts that wallet under, the other cosigners' keys, and how many of them must sign.
-`--show-multisig-keys` prints the first of those, which only a private root holds. They are
-kept back otherwise: an xpub spends nothing, but it hands every address of that branch to
-whoever reads it.
+`--show-multisig-keys` prints the first of those, for account 0, the one a wallet opens
+with, and only a private root holds them. They are kept back otherwise: an xpub spends
+nothing, but it hands every address of those branches to whoever reads it.
 
 ## Installation
 ```
@@ -64,14 +64,14 @@ same way.
 ```
 usage: indy.py [-h] [--passphrase <pass> | --ask-passphrase]
                [--allow-invalid-checksum] [--electrum] [--show-multisig-keys]
-               [--address <address>] [--broadcast]
-               [--fee-rate <rate>] [--allow-high-fee] [--yes]
-               [--address-gap <num>] [--account-gap <num>] [--host <host>]
-               [--port <port>] [--protocol {t,s}] [--no-batching] [--insecure]
+               [--address <address>] [--broadcast] [--fee-rate <rate>]
+               [--allow-high-fee] [--yes] [--address-gap <num>]
+               [--account-gap <num>] [--host <host>] [--port <port>]
+               [--protocol {t,s}] [--no-batching] [--insecure]
                [key]
 
 Find and sweep the funds of a mnemonic or bitcoin key, across the derivation
-paths and address formats the wallets that use them are known to.
+paths and address formats the wallets known here are used with.
 
 positional arguments:
   key                   key to search, and to sweep when it is private:
@@ -89,8 +89,9 @@ options:
                         match
   --electrum            read the phrase as Electrum's when it reads as BIP39
                         as well
-  --show-multisig-keys  print the BIP48 keys a private root holds, which reveal
-                        the addresses of that branch to whoever reads them
+  --show-multisig-keys  print the BIP48 keys of account 0 that a private root
+                        holds, which reveal the addresses of those branches to
+                        whoever reads them
 
 sweep transaction:
   --address <address>   craft a transaction sending all funds to this address
