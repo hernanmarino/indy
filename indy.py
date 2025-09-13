@@ -30,9 +30,12 @@ ELECTRUM_PROTOCOL_VERSIONS = ['1.4', '1.4.2']
 SATOSHIS_PER_BITCOIN = 10 ** 8
 BYTES_PER_KILOBYTE = 1_000
 
-# What SLIP-132 writes a mainnet key as, none of which the library knows for mainnet
-SLIP132_MAINNET_VERSIONS = [0x049d_7cb2, 0x049d_7878, 0x04b2_4746, 0x04b2_430c,
-                            0x0295_b43f, 0x0295_b005, 0x02aa_7ed3, 0x02aa_7a99]
+# What SLIP-132 writes a mainnet key as, none of which the library knows for mainnet. The
+# capitalised four say the key belongs to a cosigner of a BIP48 multisig, which is a wallet
+# whose addresses no single key can work out
+SLIP132_SINGLE_KEY_VERSIONS = [0x049d_7cb2, 0x049d_7878, 0x04b2_4746, 0x04b2_430c]
+SLIP132_COSIGNER_VERSIONS = [0x0295_b43f, 0x0295_b005, 0x02aa_7ed3, 0x02aa_7a99]
+SLIP132_MAINNET_VERSIONS = SLIP132_SINGLE_KEY_VERSIONS + SLIP132_COSIGNER_VERSIONS
 
 # Every way a mainnet key is written. This tool asks mainnet servers, builds mainnet addresses
 # and counts BIP48 from the mainnet coin type, so a key of any other chain has no place in it
@@ -260,6 +263,13 @@ def _read_passphrase(given: str, should_ask: bool) -> str:
     return given
 
 
+def _is_a_cosigner_key(key: str) -> bool:
+    """
+    Whether an extended key is written as what a cosigner of a BIP48 multisig holds.
+    """
+    return _key_data(key) is not None and _version_of(key) in SLIP132_COSIGNER_VERSIONS
+
+
 def _is_of_another_chain(key: str) -> bool:
     """
     Whether an extended key is written for a chain other than the one this searches.
@@ -421,6 +431,15 @@ def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False,
             'That key belongs to another chain: its prefix is not one of the ways a mainnet key '
             'is written. This looks up mainnet addresses on mainnet servers, so it has nowhere '
             'to search for it.'
+        )
+
+    if _is_a_cosigner_key(key):
+        raise ValueError(
+            'That is the account key of a multisig cosigner: its prefix is one of the four '
+            'SLIP-132 spellings that say so. The addresses of that wallet are built from the '
+            'keys of every cosigner and the number of them that must sign, so this one alone '
+            'derives none of them and there is nothing here to search for. Recovering it takes '
+            'a wallet that can put the cosigners back together.'
         )
 
     if _is_private_key(key):

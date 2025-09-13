@@ -46,6 +46,23 @@ BIP32_TEST_ZPUB = ('zpub6jftahH18ngZxUuv6oSniLNrBCSSE1B4EEU59bwTCEt8x6aS6b2mdfLx
 BIP48_PURPOSE = 48
 BIP84_PURPOSE = 84
 
+# The same key under the four SLIP-132 prefixes that stand for a cosigner of a BIP48 multisig,
+# which is what Coldcard, Sparrow and Specter hand out for one
+COSIGNER_KEYS = [
+    ('YprvANkMzkodih9AKGoi75b8yBgRAzVm6H9JGAfvV5uVdfogeNzy4nwEYvEGXfQzU'
+     'iCb2NVk8YVMSDXJ6Ct4NLwLQmFYbDzUJ12XDSEnATR3W3g'),
+    ('Ypub6bjiQGLXZ4hTXktBD789LKd9j2LFVjs9dPbXHUK7C1LfXBL7cLFV6iYkNw4Hz'
+     'bcewuPgdVWW5Wsbtj5Cfamz2oFdNvihTXY7yYqXCoB1LjT'),
+    ('ZprvAhadJRUYsNgeAZzpwSNmBGmvLxeD2u8oBHC9GUoP1gBZhUpCKT6oAytQYsNaU'
+     'crWS1cYt25utssqyVVd63MMCzw9TZgtsur1VAJRYzwAEqZ'),
+    ('Zpub6vZyhw1ShkEwP45J3TumYQietzUhSMreYW7k4sCza1iYaH9LrzR3inCtQ91sz'
+     'WGaMYWVNy74YBE9n1gmPHBzq2wEFGR83SMcFGuAbGkfiwg'),
+]
+
+# A multisig prefix on a key of another depth: what it says is the script type, not the path
+COSIGNER_PREFIX_AT_ANOTHER_DEPTH = ('Zpub72ZuDw4QvRVPACwrLwK3no3MgcA7d7qz8MmVfKp5YPPbFcHncNy7n'
+                                    '8QxAiNxkp78iyAawEM2Gn1PreZohiLMNtVvD3XVKLNmkikTrKMYCYk')
+
 # The same key under the testnet prefix, which is a testnet key and not another spelling
 BIP32_TEST_TPRV = ('tprv8ZgxMBicQKsPeDgjzdC36fs6bMjGApWDNLR9erAXMs5skhMv36j9MV5ecvfav'
                    'ji5khqjWaWSFhN3YcCUUdiKH6isR4Pwy3U5y5egddBr16m')
@@ -509,6 +526,41 @@ class TestKeyParsing(unittest.TestCase):
         self.assertIn('two of the three keys', refusal)
         self.assertIn('electrum restores it', refusal)
 
+    def test_the_key_of_a_multisig_cosigner_is_refused(self) -> None:
+        # Those four prefixes say what the key is for: a cosigner of a BIP48 multisig. Its
+        # addresses take every cosigner, so scanning it as a single key finds nothing and
+        # reports no funds for a wallet whose funds are sitting there
+        for key in COSIGNER_KEYS:
+            with self.subTest(key=key[:4]):
+                with self.assertRaises(ValueError) as refused:
+                    self._parse(key)
+
+                self.assertIn('multisig', str(refused.exception).lower())
+
+    def test_that_refusal_does_not_send_them_for_another_key_of_their_own(self) -> None:
+        # Scanned as a single key, one of these ends at the advice to bring the root xpriv.
+        # The root of this wallet derives these very keys and no addresses either: what is
+        # missing is the other cosigners', and no key of theirs stands in for those
+        with self.assertRaises(ValueError) as refused:
+            self._parse(COSIGNER_KEYS[3])
+
+        self.assertNotIn('root xpriv', str(refused.exception))
+        self.assertIn('cosigner', str(refused.exception).lower())
+
+    def test_the_single_key_spellings_are_still_taken(self) -> None:
+        # The lowercase ones say single key, and those are the ones this can search
+        for key in [BIP32_TEST_ZPRV, BIP32_TEST_ZPUB]:
+            with self.subTest(key=key[:4]):
+                self.assertIsNotNone(self._parse(key))
+
+    def test_the_multisig_prefix_is_read_off_the_prefix_and_not_the_depth(self) -> None:
+        # SLIP-132 names the script type and leaves the path open, so the refusal cannot hang
+        # on the key sitting where a BIP48 branch would
+        with self.assertRaises(ValueError) as refused:
+            self._parse(COSIGNER_PREFIX_AT_ANOTHER_DEPTH)
+
+        self.assertIn('multisig', str(refused.exception).lower())
+
     def test_a_key_of_another_chain_is_refused(self) -> None:
         # SLIP-132 is mainnet written another way; a testnet prefix is another chain. Reading
         # one here would look up mainnet addresses and count BIP48 from the mainnet coin type
@@ -517,11 +569,11 @@ class TestKeyParsing(unittest.TestCase):
 
         self.assertIn('chain', str(refused.exception).lower())
 
-    def test_the_mainnet_spellings_are_all_taken(self) -> None:
-        # The ten ways a mainnet key is written, spelled out here rather than read from the
-        # code that has to know them
-        private_versions = ['0488ade4', '049d7878', '04b2430c', '0295b005', '02aa7a99']
-        public_versions = ['0488b21e', '049d7cb2', '04b24746', '0295b43f', '02aa7ed3']
+    def test_the_single_key_mainnet_spellings_are_all_taken(self) -> None:
+        # The six ways a mainnet single key is written, spelled out here rather than read from
+        # the code that has to know them. The other four say cosigner, and are turned down
+        private_versions = ['0488ade4', '049d7878', '04b2430c']
+        public_versions = ['0488b21e', '049d7cb2', '04b24746']
 
         for versions, key in [(private_versions, BIP32_TEST_XPRIV), (public_versions, BIP32_TEST_XPUB)]:
             payload = base58.b58decode_check(key)[4:]
