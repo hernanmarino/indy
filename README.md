@@ -10,9 +10,9 @@ You can use Indy to sweep all the funds to a destination address of your choice.
 
 ## Features
 
-* Supports sweeping funds from mnemonics and xprivs, and finding them from an xpub: what a
-  wallet exports is the key of an account, and its addresses hang right under it. Spending
-  them still takes the private key
+* Supports sweeping funds from mnemonics and xprivs, and finding them from the account xpub
+  a wallet exports, whose addresses hang right under it. Spending them still takes the
+  private key, and a root xpub reaches only what sits under no hardened level
 * Supports mnemonics in Chinese, Czech, English, French, Italian, Japanese, Korean,
   Portuguese, Russian, Spanish and Turkish
 * Supports Electrum seed phrases, standard and segwit, which are not BIP39 and derive a

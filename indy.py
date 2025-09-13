@@ -503,6 +503,23 @@ def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False,
     raise ValueError('The key is invalid or the format isn\'t recognized. Make sure it\'s a mnemonic, xpriv or xpub.')
 
 
+def _report_what_a_public_key_reaches(master_key: BIP32) -> None:
+    """
+    Say which of the paths a public key can walk, which depends on where the key sits.
+    """
+    print('🔍  A public key reaches only the addresses right under it, and nothing below a')
+    print('    hardened level. Nothing can be swept without the private key either')
+
+    if master_key.depth != ROOT_DEPTH:
+        return
+
+    # From a root, those two paths are an Electrum standard wallet and no other: every wallet
+    # under BIP44, BIP49 or BIP84 keeps its addresses below the hardened level of an account
+    print('    This key is a root, so that is the Electrum standard wallet and nothing else.')
+    print('    A BIP44, BIP49 or BIP84 wallet keeps its addresses under an account: for those,')
+    print('    the account xpub is the one to bring, which is what a wallet exports')
+
+
 def _report_multisig_keys(master_key: BIP32, should_show_keys: bool) -> None:
     """
     Say what a multisig of this seed would take, and hand over its keys if they were asked for.
@@ -555,8 +572,7 @@ async def find_utxos(
     Connect to an electrum server and find every UTXO a key reaches, spendable or not.
     """
     if master_key.master_privkey is None:
-        print('🔍  A public key reaches only the addresses right under it, which is where an')
-        print('    exported account key keeps them. Nothing can be swept without the private key')
+        _report_what_a_public_key_reaches(master_key)
 
     if not insecure and server.protocols != {'s'}:
         print('⛔️  That server would be reached over plain TCP, putting every address this looks up')

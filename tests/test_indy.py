@@ -1043,6 +1043,31 @@ class TestPublicKeyScan(unittest.TestCase):
         self.assertEqual(account.get_pubkey_from_path([0, 0]),
                          private.get_pubkey_from_path(account_path + [0, 0]))
 
+    def test_a_root_public_key_is_told_how_little_it_reaches(self) -> None:
+        # Of the paths here, a root public key can walk only the two with no hardened level,
+        # which is where an Electrum standard wallet keeps its addresses and nowhere else.
+        # Saying it reaches 'where an exported account key keeps them' would be the opposite
+        output, _ = self._run(key=BIP32.from_xpub(BIP32_TEST_XPUB))
+
+        self.assertIn('account', output.lower())
+        self.assertRegex(output, r'BIP ?44|BIP44')
+
+    def test_an_account_public_key_is_told_it_is_in_the_right_place(self) -> None:
+        private = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+        account = BIP32.from_xpub(private.get_xpub_from_path([BIP84_PURPOSE + HARDENED_INDEX,
+                                                              HARDENED_INDEX, HARDENED_INDEX]))
+        output, _ = self._run(key=account)
+
+        self.assertNotRegex(output, r'BIP ?44')
+
+    def test_the_two_are_not_told_the_same_thing(self) -> None:
+        root, _ = self._run(key=BIP32.from_xpub(BIP32_TEST_XPUB))
+        private = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+        account, _ = self._run(key=BIP32.from_xpub(
+            private.get_xpub_from_path([BIP84_PURPOSE + HARDENED_INDEX, HARDENED_INDEX, HARDENED_INDEX])))
+
+        self.assertNotEqual(root, account)
+
     def test_a_public_key_now_reaches_the_server(self) -> None:
         # It used to be turned away before connecting, which left an exported account key
         # with nowhere to go
