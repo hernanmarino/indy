@@ -46,6 +46,32 @@ BIP32_TEST_ZPUB = ('zpub6jftahH18ngZxUuv6oSniLNrBCSSE1B4EEU59bwTCEt8x6aS6b2mdfLx
 BIP48_PURPOSE = 48
 BIP84_PURPOSE = 84
 
+# What a cosigner really exports, derived here at the BIP48 branches and written under the
+# four SLIP-132 prefixes that say the output is a multisig one
+COSIGNER_KEYS = [
+    ('YprvAWq4Y4VspSpY74t2zKZ2pyYzXG4Ho5BmoMEQAha8WrEywwFoVyQ2CKz3kcxMM'
+     'gEsnaifnkTVnQNMctSaiccmnrqhC9UesiYMpxpuvQruJXL'),
+    ('Ypub6jpQwa2mepNqKYxW6M63C7Vj5HtnCXudAa9zy5yk5Bmxpjax3WiGk8JXbtgQS'
+     'bRTsQaiJC7cpTnppsf52vJemv8TXuk7UHJFSzNTV7sH675'),
+    ('ZprvAqfKqjAny8N22kzr6vNCjGGYnAsrNwPdrnFcZyAXZcys2MgiYonSXtuFYbj7h'
+     'PWVPLYpc68PFTyhKWyrwnAL7vrCAsjhkWMncUSHsmH7bB7'),
+    ('Zpub74egFEhgoVvKFF5KCwuD6QDHLCiLnQ7VE1BDNMa97xWquA1s6M6h5hDjPt24d'
+     'Yd6hGJWhx1DsNDeydR5t217GsNUQ3TRLuDoZanv6xbRqnP'),
+]
+
+# Keys of the same wallet at depths this cannot place: a chain key, public and private, whose
+# addresses hang one level under it, and a coin type one, whose account level is still missing
+CHAIN_XPRIV = ('xprvA2FgjeA3n5EwtdrdQMPjBLyX8ibH1eyXTcVNNH1CA2qGJYYjPiBiPz5d9L6Az'
+               'qL6nxRuv3d4PmNuUKCNmpmgiuNVBMvrCMMWkZPfTuJ2uSJ')
+CHAIN_XPUB = ('xpub6FF399gwcSoF77w6WNvjYUvFgkRmR7hNpqQyAfQoiNNFBLsswFVxwnQ6zafr2'
+              'GEYDoK98Hwq4wA8CVnRbH7yURcHTeWXiDSZ5v3jLCmaWns')
+COIN_TYPE_XPUB = ('xpub6AHmbjdVAckDYp68ymb93PxoLnX6s7BKQUju4PQWTh6AVzUXoJoq1yXTqMgSd'
+                  'XfoMEbCZzvmLZeR5bMAExRaw9vxqzrvyFppkVhWXck85se')
+
+# A multisig prefix on a key of another depth: what it says is the script type, not the path
+COSIGNER_PREFIX_AT_ANOTHER_DEPTH = ('Zpub72ZuDw4QvRVPACwrLwK3no3MgcA7d7qz8MmVfKp5YPPbFcHncNy7n'
+                                    '8QxAiNxkp78iyAawEM2Gn1PreZohiLMNtVvD3XVKLNmkikTrKMYCYk')
+
 # The same key under the testnet prefix, which is a testnet key and not another spelling
 BIP32_TEST_TPRV = ('tprv8ZgxMBicQKsPeDgjzdC36fs6bMjGApWDNLR9erAXMs5skhMv36j9MV5ecvfav'
                    'ji5khqjWaWSFhN3YcCUUdiKH6isR4Pwy3U5y5egddBr16m')
@@ -509,6 +535,91 @@ class TestKeyParsing(unittest.TestCase):
         self.assertIn('two of the three keys', refusal)
         self.assertIn('electrum restores it', refusal)
 
+    def test_the_key_of_a_multisig_cosigner_is_refused(self) -> None:
+        # Those four prefixes say the key spends to a multisig output. Its addresses take
+        # every cosigner, so scanning it as a single key finds nothing and reports no funds
+        # for a wallet whose funds are sitting there
+        for key in COSIGNER_KEYS:
+            with self.subTest(key=key[:4]):
+                self.assertEqual(base58.b58decode_check(key)[4], 4)
+
+                with self.assertRaises(ValueError) as refused:
+                    self._parse(key)
+
+                self.assertIn('multisig', str(refused.exception).lower())
+
+    def test_that_refusal_does_not_send_them_for_another_key_of_their_own(self) -> None:
+        # Scanned as a single key, one of these ends at the advice to bring the root xpriv.
+        # The root of this wallet derives these very keys and no addresses either: what is
+        # missing is the other cosigners', and no key of theirs stands in for those
+        with self.assertRaises(ValueError) as refused:
+            self._parse(COSIGNER_KEYS[3])
+
+        self.assertNotIn('root xpriv', str(refused.exception))
+        self.assertIn('cosigner', str(refused.exception).lower())
+
+    def test_the_single_key_spellings_are_still_taken(self) -> None:
+        # The lowercase ones say single key, and those are the ones this can search
+        for key in [BIP32_TEST_ZPRV, BIP32_TEST_ZPUB]:
+            with self.subTest(key=key[:4]):
+                self.assertIsNotNone(self._parse(key))
+
+    def test_a_key_this_cannot_place_is_refused_before_any_scan(self) -> None:
+        # The addresses of a chain key hang one level under it, not two, so scanning it looks
+        # up hundreds of addresses that are not the wallet's, hands that list to a server, and
+        # ends at a negative answer that is simply wrong
+        for key in [CHAIN_XPRIV, CHAIN_XPUB, COIN_TYPE_XPUB]:
+            with self.subTest(key=key[:8]):
+                with self.assertRaises(ValueError) as refused:
+                    self._parse(key)
+
+                self.assertIn('levels', str(refused.exception).lower())
+
+    def test_a_key_this_cannot_place_never_reaches_a_server(self) -> None:
+        # What the refusal is worth is where it happens: the whole point is to hand no server
+        # the addresses of nobody, so nothing may be built or asked before it, and a key it
+        # turns down cannot be announced as one it read either
+        for key in [CHAIN_XPRIV, CHAIN_XPUB]:
+            with self.subTest(key=key[:8]):
+                reached = []
+
+                def client(**kwargs: object) -> object:
+                    reached.append('client')
+                    raise AssertionError('A client was built for a key this cannot place')
+
+                async def scan(*args: object, **kwargs: object) -> List[scanner.Utxo]:
+                    reached.append('scan')
+                    return []
+
+                output = io.StringIO()
+
+                with mock.patch.object(indy, 'StratumClient', client), \
+                     mock.patch.object(scanner, 'scan_master_key', scan), \
+                     mock.patch.object(sys, 'argv', ['indy.py', key]), \
+                     redirect_stdout(output):
+                    with self.assertRaises(ValueError):
+                        indy.main()
+
+                self.assertEqual(reached, [])
+                self.assertNotIn('successfully', output.getvalue())
+
+    def test_a_root_and_an_account_are_the_two_it_can_place(self) -> None:
+        private = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+        account = private.get_xpub_from_path([BIP84_PURPOSE + HARDENED_INDEX,
+                                              HARDENED_INDEX, HARDENED_INDEX])
+
+        for key in [BIP32_TEST_XPRIV, BIP32_TEST_XPUB, account]:
+            with self.subTest(key=key[:8]):
+                self.assertIsNotNone(self._parse(key))
+
+    def test_the_multisig_prefix_is_read_off_the_prefix_and_not_the_depth(self) -> None:
+        # SLIP-132 names the script type and leaves the path open, so the refusal cannot hang
+        # on the key sitting where a BIP48 branch would
+        with self.assertRaises(ValueError) as refused:
+            self._parse(COSIGNER_PREFIX_AT_ANOTHER_DEPTH)
+
+        self.assertIn('multisig', str(refused.exception).lower())
+
     def test_a_key_of_another_chain_is_refused(self) -> None:
         # SLIP-132 is mainnet written another way; a testnet prefix is another chain. Reading
         # one here would look up mainnet addresses and count BIP48 from the mainnet coin type
@@ -517,11 +628,11 @@ class TestKeyParsing(unittest.TestCase):
 
         self.assertIn('chain', str(refused.exception).lower())
 
-    def test_the_mainnet_spellings_are_all_taken(self) -> None:
-        # The ten ways a mainnet key is written, spelled out here rather than read from the
-        # code that has to know them
-        private_versions = ['0488ade4', '049d7878', '04b2430c', '0295b005', '02aa7a99']
-        public_versions = ['0488b21e', '049d7cb2', '04b24746', '0295b43f', '02aa7ed3']
+    def test_the_single_key_mainnet_spellings_are_all_taken(self) -> None:
+        # The six ways a mainnet single key is written, spelled out here rather than read from
+        # the code that has to know them. The other four say cosigner, and are turned down
+        private_versions = ['0488ade4', '049d7878', '04b2430c']
+        public_versions = ['0488b21e', '049d7cb2', '04b24746']
 
         for versions, key in [(private_versions, BIP32_TEST_XPRIV), (public_versions, BIP32_TEST_XPUB)]:
             payload = base58.b58decode_check(key)[4:]
@@ -983,13 +1094,32 @@ class TestPublicKeyScan(unittest.TestCase):
         self.assertIn('Found used addresses', output)
         self.assertIn('Total spendable balance found: 100000', output)
 
-    def test_what_it_reaches_there_is_what_the_whole_seed_would(self) -> None:
+    def _key_at(self, path: List[int]) -> BIP32:
+        """
+        The public key a wallet would export at a given depth of the test vector.
+        """
         private = BIP32.from_xpriv(BIP32_TEST_XPRIV)
-        account_path = [BIP84_PURPOSE + HARDENED_INDEX, HARDENED_INDEX, HARDENED_INDEX]
-        account = BIP32.from_xpub(private.get_xpub_from_path(account_path))
 
-        self.assertEqual(account.get_pubkey_from_path([0, 0]),
-                         private.get_pubkey_from_path(account_path + [0, 0]))
+        return BIP32.from_xpub(private.get_xpub_from_path(path) if path else BIP32_TEST_XPUB)
+
+    def test_the_two_depths_that_get_here_are_told_different_things(self) -> None:
+        # An account key is where the two chains right under it hold the addresses, and a root
+        # is an Electrum standard wallet and nothing else. Every other depth is turned down at
+        # parsing, so those are the only two this has to tell apart
+        account_path = [BIP84_PURPOSE + HARDENED_INDEX, HARDENED_INDEX, HARDENED_INDEX]
+        said = {}
+
+        for name, path in [('root', []), ('account', account_path)]:
+            output, _ = self._run(key=self._key_at(path))
+            said[name] = output[:output.index('⏳')]
+
+        self.assertIn('Electrum standard', said['root'])
+        self.assertIn('account xpub', said['root'])
+
+        self.assertNotIn('Electrum standard', said['account'])
+        self.assertNotIn('account xpub', said['account'].lower())
+
+        self.assertNotEqual(said['root'], said['account'])
 
     def test_a_public_key_now_reaches_the_server(self) -> None:
         # It used to be turned away before connecting, which left an exported account key
@@ -1075,6 +1205,7 @@ class TestMultisigKeys(unittest.TestCase):
 
         self.assertIn('multisig', output.lower())
         self.assertIn('--show-multisig-keys', output)
+        self.assertIn('account 0', output)
         self.assertNotIn('xpub', output)
 
     def test_finding_nothing_offers_the_keys_of_a_multisig(self) -> None:
@@ -1095,6 +1226,13 @@ class TestMultisigKeys(unittest.TestCase):
 
         self.assertIn('multisig', output.lower())
         self.assertIn('cosigner', output.lower())
+
+    def test_it_says_which_account_of_that_wallet_these_are(self) -> None:
+        # BIP48 numbers its accounts, and only the first one is handed over: a multisig on
+        # another account has other keys, and nothing here would say so
+        output = self._run(BIP32.from_xpriv(BIP32_TEST_XPRIV))
+
+        self.assertIn('account 0', output)
 
     def test_finding_something_does_not_take_the_offer_away(self) -> None:
         # One seed can stand behind a singlesig wallet and a multisig one at once, and a small
@@ -1125,6 +1263,30 @@ class TestMultisigKeys(unittest.TestCase):
 
         self.assertIn('xpub', output)
         self.assertNotIn('tpub', output)
+
+    def test_each_key_is_printed_under_the_path_and_type_it_belongs_to(self) -> None:
+        # The three columns are what gets copied into a multisig tool: a key under the wrong
+        # path or the wrong script type is a key that will not rebuild the wallet
+        root = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+        output = self._run(root)
+
+        for branch, script_type in [(1, 'P2SH-P2WSH'), (2, 'P2WSH')]:
+            with self.subTest(branch=branch):
+                expected = root.get_xpub_from_path([BIP48_PURPOSE + HARDENED_INDEX, HARDENED_INDEX,
+                                                    HARDENED_INDEX, branch + HARDENED_INDEX])
+                written = [line for line in output.splitlines() if expected in line]
+
+                self.assertEqual(len(written), 1)
+
+                path, spelled, key = written[0].split()
+
+                self.assertEqual(path, f"m/{BIP48_PURPOSE}'/0'/0'/{branch}'")
+                self.assertEqual(spelled, script_type)
+                self.assertEqual(key, expected)
+
+        printed = [line.strip() for line in output.splitlines() if line.startswith('    m/')]
+
+        self.assertEqual(len(printed), 2)
 
     def test_those_keys_are_the_ones_the_root_derives(self) -> None:
         root = BIP32.from_xpriv(BIP32_TEST_XPRIV)
