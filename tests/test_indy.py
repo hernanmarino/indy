@@ -59,6 +59,15 @@ COSIGNER_KEYS = [
      'WGaMYWVNy74YBE9n1gmPHBzq2wEFGR83SMcFGuAbGkfiwg'),
 ]
 
+# Keys of the same wallet at depths this cannot place: a chain key, public and private, whose
+# addresses hang one level under it, and a coin type one, whose account level is still missing
+CHAIN_XPRIV = ('xprvA2FgjeA3n5EwtdrdQMPjBLyX8ibH1eyXTcVNNH1CA2qGJYYjPiBiPz5d9L6Az'
+               'qL6nxRuv3d4PmNuUKCNmpmgiuNVBMvrCMMWkZPfTuJ2uSJ')
+CHAIN_XPUB = ('xpub6FF399gwcSoF77w6WNvjYUvFgkRmR7hNpqQyAfQoiNNFBLsswFVxwnQ6zafr2'
+              'GEYDoK98Hwq4wA8CVnRbH7yURcHTeWXiDSZ5v3jLCmaWns')
+COIN_TYPE_XPUB = ('xpub6AHmbjdVAckDYp68ymb93PxoLnX6s7BKQUju4PQWTh6AVzUXoJoq1yXTqMgSd'
+                  'XfoMEbCZzvmLZeR5bMAExRaw9vxqzrvyFppkVhWXck85se')
+
 # A multisig prefix on a key of another depth: what it says is the script type, not the path
 COSIGNER_PREFIX_AT_ANOTHER_DEPTH = ('Zpub72ZuDw4QvRVPACwrLwK3no3MgcA7d7qz8MmVfKp5YPPbFcHncNy7n'
                                     '8QxAiNxkp78iyAawEM2Gn1PreZohiLMNtVvD3XVKLNmkikTrKMYCYk')
@@ -551,6 +560,54 @@ class TestKeyParsing(unittest.TestCase):
         # The lowercase ones say single key, and those are the ones this can search
         for key in [BIP32_TEST_ZPRV, BIP32_TEST_ZPUB]:
             with self.subTest(key=key[:4]):
+                self.assertIsNotNone(self._parse(key))
+
+    def test_a_key_this_cannot_place_is_refused_before_any_scan(self) -> None:
+        # The addresses of a chain key hang one level under it, not two, so scanning it looks
+        # up hundreds of addresses that are not the wallet's, hands that list to a server, and
+        # ends at a negative answer that is simply wrong
+        for key in [CHAIN_XPRIV, CHAIN_XPUB, COIN_TYPE_XPUB]:
+            with self.subTest(key=key[:8]):
+                with self.assertRaises(ValueError) as refused:
+                    self._parse(key)
+
+                self.assertIn('levels', str(refused.exception).lower())
+
+    def test_a_key_this_cannot_place_never_reaches_a_server(self) -> None:
+        # What the refusal is worth is where it happens: the whole point is to hand no server
+        # the addresses of nobody, so nothing may be built or asked before it, and a key it
+        # turns down cannot be announced as one it read either
+        for key in [CHAIN_XPRIV, CHAIN_XPUB]:
+            with self.subTest(key=key[:8]):
+                reached = []
+
+                def client(**kwargs: object) -> object:
+                    reached.append('client')
+                    raise AssertionError('A client was built for a key this cannot place')
+
+                async def scan(*args: object, **kwargs: object) -> List[scanner.Utxo]:
+                    reached.append('scan')
+                    return []
+
+                output = io.StringIO()
+
+                with mock.patch.object(indy, 'StratumClient', client), \
+                     mock.patch.object(scanner, 'scan_master_key', scan), \
+                     mock.patch.object(sys, 'argv', ['indy.py', key]), \
+                     redirect_stdout(output):
+                    with self.assertRaises(ValueError):
+                        indy.main()
+
+                self.assertEqual(reached, [])
+                self.assertNotIn('successfully', output.getvalue())
+
+    def test_a_root_and_an_account_are_the_two_it_can_place(self) -> None:
+        private = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+        account = private.get_xpub_from_path([BIP84_PURPOSE + HARDENED_INDEX,
+                                              HARDENED_INDEX, HARDENED_INDEX])
+
+        for key in [BIP32_TEST_XPRIV, BIP32_TEST_XPUB, account]:
+            with self.subTest(key=key[:8]):
                 self.assertIsNotNone(self._parse(key))
 
     def test_the_multisig_prefix_is_read_off_the_prefix_and_not_the_depth(self) -> None:

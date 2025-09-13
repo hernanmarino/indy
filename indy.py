@@ -46,8 +46,10 @@ VERSION_LENGTH_IN_BYTES = 4
 BIP48_PURPOSE = 48
 MULTISIG_BRANCHES = [(1, 'P2SH-P2WSH'), (2, 'P2WSH')]
 
-# Only a key that is a root has the levels BIP48 counts from under it
+# Where a key sits decides what hangs under it: a root has everything below hardened levels,
+# and an account key, three down, has its addresses in the two chains right under it
 ROOT_DEPTH = 0
+ACCOUNT_DEPTH = 3
 
 # Electrum writes its phrases with the same words as BIP39 and tells its own apart by a version
 # it works out of them. The two kinds it makes today are a standard wallet and a segwit one; the
@@ -277,6 +279,25 @@ def _is_of_another_chain(key: str) -> bool:
     return _key_data(key) is not None and _version_of(key) not in MAINNET_VERSIONS
 
 
+def _placed(key: BIP32) -> BIP32:
+    """
+    Hand back a key this knows where to look under, and turn down one it does not.
+    """
+    # Under a root everything hangs below a hardened level, and under an account key the two
+    # chains are right there. Anywhere else the addresses sit at a remove nothing here knows:
+    # scanning anyway would hand a server hundreds of addresses of no one and end at a
+    # negative answer that is simply wrong
+    if key.depth in [ROOT_DEPTH, ACCOUNT_DEPTH]:
+        return key
+
+    raise ValueError(
+        f'That key is {key.depth} levels down, and this can only place two: a root, at 0, and the '
+        f'key of an account, at {ACCOUNT_DEPTH}, which is what a wallet exports. At any other '
+        'depth the addresses hang at a remove this cannot guess, so there is nowhere here to '
+        'look for them. Bring the seed phrase, the root key, or the account one.'
+    )
+
+
 def _on_mainnet(key: BIP32, written: str) -> BIP32:
     """
     Read a key written under a SLIP-132 prefix as the mainnet key it is.
@@ -445,18 +466,28 @@ def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False,
     if _is_private_key(key):
         try:
             private_key = BIP32.from_xpriv(key)
-            print('🔑  Read private key successfully')
-            return _on_mainnet(private_key, key)
         except Exception:
             pass
+        else:
+            # Placed before the success is announced: a key this cannot look under is not one
+            # it read to any purpose, and saying so first and turning it down after reads as
+            # though the refusal came from somewhere else
+            placed = _placed(_on_mainnet(private_key, key))
+            print('🔑  Read private key successfully')
+            return placed
 
     if _is_public_key(key):
         try:
             public_key = BIP32.from_xpub(key)
-            print('🔑  Read public key successfully')
-            return _on_mainnet(public_key, key)
         except Exception:
             pass
+        else:
+            # Placed before the success is announced: a key this cannot look under is not one
+            # it read to any purpose, and saying so first and turning it down after reads as
+            # though the refusal came from somewhere else
+            placed = _placed(_on_mainnet(public_key, key))
+            print('🔑  Read public key successfully')
+            return placed
 
     electrum_version = _electrum_version_of(key)
 
