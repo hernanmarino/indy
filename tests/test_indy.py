@@ -16,7 +16,7 @@ from typing import List, Optional, Set, Tuple
 from unittest import mock
 
 import base58
-from bip32 import BIP32, HARDENED_INDEX
+from bip32 import BIP32, HARDENED_INDEX, PrivateDerivationError
 from connectrum.client import StratumClient
 from connectrum.svr_info import ServerInfo
 from mnemonic import Mnemonic
@@ -410,6 +410,32 @@ class TestKeyParsing(unittest.TestCase):
                 self.assertEqual(rewritten, plain)
                 self.assertEqual(base58.b58decode_check(rewritten)[VERSION_LENGTH_IN_BYTES:],
                                  base58.b58decode_check(under_slip132)[VERSION_LENGTH_IN_BYTES:])
+
+    def test_the_library_turns_down_a_prefix_it_does_not_know(self) -> None:
+        # What the rewriting is for, said as the library says it: handed a SLIP-132 key as
+        # written, it refuses. Reading a zprv wallet rests on those four bytes being put back
+        with self.assertRaises(ValueError):
+            BIP32.from_xpriv(BIP32_TEST_ZPRV)
+
+        with self.assertRaises(ValueError):
+            BIP32.from_xpub(BIP32_TEST_ZPUB)
+
+    def test_the_library_turns_down_a_public_key_read_as_a_private_one(self) -> None:
+        # It used to take the x coordinate of the point for the scalar and hand back a key
+        # that derives addresses of no one, which is why the marker is looked at before it
+        with self.assertRaises(ValueError):
+            BIP32.from_xpriv(BIP32_TEST_XPUB)
+
+    def test_the_library_names_what_a_public_key_cannot_derive(self) -> None:
+        # A bare AssertionError with no message used to come out of here, and there is no
+        # telling one of those from a broken invariant of this program's own
+        public = BIP32.from_xpub(BIP32_TEST_XPUB)
+
+        with self.assertRaises(PrivateDerivationError):
+            public.get_privkey_from_path([0])
+
+        with self.assertRaises(PrivateDerivationError):
+            public.get_pubkey_from_path([HARDENED_INDEX])
 
     def test_a_key_already_written_for_mainnet_is_handed_back_as_it_came(self) -> None:
         for key in [BIP32_TEST_XPRIV, BIP32_TEST_XPUB]:
