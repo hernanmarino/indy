@@ -37,9 +37,12 @@ SLIP132_SINGLE_KEY_VERSIONS = [0x049d_7cb2, 0x049d_7878, 0x04b2_4746, 0x04b2_430
 SLIP132_COSIGNER_VERSIONS = [0x0295_b43f, 0x0295_b005, 0x02aa_7ed3, 0x02aa_7a99]
 SLIP132_MAINNET_VERSIONS = SLIP132_SINGLE_KEY_VERSIONS + SLIP132_COSIGNER_VERSIONS
 
-# Every way a mainnet key is written. This tool asks mainnet servers, builds mainnet addresses
-# and counts BIP48 from the mainnet coin type, so a key of any other chain has no place in it
-MAINNET_VERSIONS = [0x0488_b21e, 0x0488_ade4] + SLIP132_MAINNET_VERSIONS
+# The two the library reads, and every way a mainnet key is written. This tool asks mainnet
+# servers, builds mainnet addresses and counts BIP48 from the mainnet coin type, so a key of
+# any other chain has no place in it
+XPUB_VERSION = 0x0488_b21e
+XPRIV_VERSION = 0x0488_ade4
+MAINNET_VERSIONS = [XPUB_VERSION, XPRIV_VERSION] + SLIP132_MAINNET_VERSIONS
 VERSION_LENGTH_IN_BYTES = 4
 
 # The branches BIP48 puts a multisig under, by the script type each one spends to
@@ -302,16 +305,23 @@ def _placed(key: BIP32) -> BIP32:
     )
 
 
-def _on_mainnet(key: BIP32, written: str) -> BIP32:
+def _as_mainnet(key: str) -> str:
     """
-    Read a key written under a SLIP-132 prefix as the mainnet key it is.
+    Write a key spelled under a SLIP-132 prefix the way a mainnet key is spelled.
     """
-    # The library calls a key testnet unless it was spelled xprv or xpub, so a zprv would
-    # otherwise hand back keys that read tpub
-    if _version_of(written) in SLIP132_MAINNET_VERSIONS:
-        key.network = 'main'
+    # SLIP-132 names the script type in the version bytes and changes nothing else, so the
+    # key is the same key written another way. The library knows xprv and xpub and reads
+    # anything else as another chain, so the four bytes are put back before it sees them
+    if _version_of(key) not in SLIP132_MAINNET_VERSIONS:
+        return key
 
-    return key
+    decoded = base58.b58decode_check(key)
+    # Read off what the key carries rather than off the prefix: the two spellings of a
+    # SLIP-132 pair differ in the prefix alone, which is the very thing being replaced
+    version = XPRIV_VERSION if decoded[KEY_DATA_STARTS_AT] == PRIVATE_KEY_MARKER else XPUB_VERSION
+    rewritten = version.to_bytes(VERSION_LENGTH_IN_BYTES, 'big') + decoded[VERSION_LENGTH_IN_BYTES:]
+
+    return base58.b58encode_check(rewritten).decode()
 
 
 def _version_of(key: str) -> int:
@@ -469,27 +479,27 @@ def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False,
 
     if _is_private_key(key):
         try:
-            private_key = BIP32.from_xpriv(key)
+            private_key = BIP32.from_xpriv(_as_mainnet(key))
         except Exception:
             pass
         else:
             # Placed before the success is announced: a key this cannot look under is not one
             # it read to any purpose, and saying so first and turning it down after reads as
             # though the refusal came from somewhere else
-            placed = _placed(_on_mainnet(private_key, key))
+            placed = _placed(private_key)
             print('🔑  Read private key successfully')
             return placed
 
     if _is_public_key(key):
         try:
-            public_key = BIP32.from_xpub(key)
+            public_key = BIP32.from_xpub(_as_mainnet(key))
         except Exception:
             pass
         else:
             # Placed before the success is announced: a key this cannot look under is not one
             # it read to any purpose, and saying so first and turning it down after reads as
             # though the refusal came from somewhere else
-            placed = _placed(_on_mainnet(public_key, key))
+            placed = _placed(public_key)
             print('🔑  Read public key successfully')
             return placed
 
@@ -566,7 +576,7 @@ def _report_multisig_keys(master_key: BIP32, should_show_keys: bool) -> None:
 
     # What this key can give comes before what was asked of it: offering a flag that would
     # answer with an excuse is worse than saying the excuse now
-    if master_key.master_privkey is None:
+    if master_key.privkey is None:
         print('    Its keys hang off levels a public key cannot derive: that takes the seed')
         print('    phrase or the root xpriv')
         return
@@ -608,7 +618,7 @@ async def find_utxos(
     """
     Connect to an electrum server and find every UTXO a key reaches, spendable or not.
     """
-    if master_key.master_privkey is None:
+    if master_key.privkey is None:
         _report_what_a_public_key_reaches(master_key)
 
     if not insecure and server.protocols != {'s'}:
@@ -636,7 +646,7 @@ async def find_utxos(
 
     _report_multisig_keys(master_key, show_multisig_keys)
 
-    if master_key.master_privkey is None:
+    if master_key.privkey is None:
         print('✍️  Re-run with a private key to create a sweep transaction')
         client.close()
         return
