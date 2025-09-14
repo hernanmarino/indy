@@ -286,7 +286,7 @@ class ScriptIterator:
         for path, types in descriptors.items():
             # A public key derives no hardened level, so those paths are left out rather than
             # walked into the failure of deriving one
-            if master_key.master_privkey is None and Path(path).has_hardened_levels():
+            if master_key.privkey is None and Path(path).has_hardened_levels():
                 continue
 
             for type in types:

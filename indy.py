@@ -576,7 +576,7 @@ def _report_multisig_keys(master_key: BIP32, should_show_keys: bool) -> None:
 
     # What this key can give comes before what was asked of it: offering a flag that would
     # answer with an excuse is worse than saying the excuse now
-    if master_key.master_privkey is None:
+    if master_key.privkey is None:
         print('    Its keys hang off levels a public key cannot derive: that takes the seed')
         print('    phrase or the root xpriv')
         return
@@ -618,7 +618,7 @@ async def find_utxos(
     """
     Connect to an electrum server and find every UTXO a key reaches, spendable or not.
     """
-    if master_key.master_privkey is None:
+    if master_key.privkey is None:
         _report_what_a_public_key_reaches(master_key)
 
     if not insecure and server.protocols != {'s'}:
@@ -646,7 +646,7 @@ async def find_utxos(
 
     _report_multisig_keys(master_key, show_multisig_keys)
 
-    if master_key.master_privkey is None:
+    if master_key.privkey is None:
         print('✍️  Re-run with a private key to create a sweep transaction')
         client.close()
         return

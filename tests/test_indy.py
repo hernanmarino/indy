@@ -317,8 +317,8 @@ class TestKeyParsing(unittest.TestCase):
                     expected = hashlib.pbkdf2_hmac('sha512', unicodedata.normalize('NFKD', phrase).encode(),
                                                    salt, 2048)
 
-                    self.assertEqual(self._read(phrase, passphrase).master_privkey,
-                                     BIP32.from_seed(expected).master_privkey)
+                    self.assertEqual(self._read(phrase, passphrase).privkey,
+                                     BIP32.from_seed(expected).privkey)
 
     def test_a_phrase_in_another_language_is_read(self) -> None:
         for language in ['spanish', 'french', 'japanese', 'italian']:
@@ -327,28 +327,28 @@ class TestKeyParsing(unittest.TestCase):
     def test_a_phrase_spaced_out_any_other_way_derives_the_same_key(self) -> None:
         # A phrase arrives pasted out of a document or a password manager, where it picks up a
         # trailing space or a line break. Deriving from that spelling gives a wallet nobody has
-        canonical = self._parse(self.VALID).master_privkey
+        canonical = self._parse(self.VALID).privkey
 
         for spelling in [' ' + self.VALID, self.VALID + '\n', self.VALID + '  ',
                          self.VALID.replace(' ', '  ', 1), self.VALID.replace(' ', '\t', 1),
                          self.VALID.replace(' ', ' \n ', 1)]:
             with self.subTest(spelling=repr(spelling[:14])):
-                self.assertEqual(self._parse(spelling).master_privkey, canonical)
+                self.assertEqual(self._parse(spelling).privkey, canonical)
 
     def test_the_passphrase_keeps_every_space_it_was_given(self) -> None:
         # Settling the spacing of the phrase must not reach the passphrase: it is a secret of
         # its own, and two that differ only in a space open two different wallets
         spellings = [' a spoken passphrase', 'a spoken passphrase ', 'a  spoken passphrase',
                      'a spoken\tpassphrase', 'a spoken passphrase']
-        derived = {self._read(self.VALID, spelling).master_privkey for spelling in spellings}
+        derived = {self._read(self.VALID, spelling).privkey for spelling in spellings}
 
         self.assertEqual(len(derived), len(spellings))
 
     def test_that_holds_for_the_phrases_of_other_wordlists_too(self) -> None:
         for phrase in NEW_WORDLIST_PHRASES:
             with self.subTest(phrase=phrase.split()[0]):
-                self.assertEqual(self._parse(phrase + '\n').master_privkey,
-                                 self._parse(phrase).master_privkey)
+                self.assertEqual(self._parse(phrase + '\n').privkey,
+                                 self._parse(phrase).privkey)
 
     def test_a_mnemonic_whose_checksum_does_not_check_out_is_refused(self) -> None:
         with self.assertRaises(ValueError):
@@ -375,7 +375,7 @@ class TestKeyParsing(unittest.TestCase):
 
     def test_a_public_key_is_not_read_as_a_private_one(self) -> None:
         # Its key data is a point, not a scalar, and taking one for the other invents a wallet
-        self.assertIsNone(self._parse(BIP32_TEST_XPUB).master_privkey)
+        self.assertIsNone(self._parse(BIP32_TEST_XPUB).privkey)
 
     def test_a_public_key_stands_for_the_key_it_was_exported_from(self) -> None:
         public = self._parse(BIP32_TEST_XPUB)
@@ -386,7 +386,7 @@ class TestKeyParsing(unittest.TestCase):
     def test_a_public_key_under_another_prefix_is_still_read_as_public(self) -> None:
         under_slip132 = self._parse(BIP32_TEST_ZPUB)
 
-        self.assertIsNone(under_slip132.master_privkey)
+        self.assertIsNone(under_slip132.privkey)
         self.assertEqual(under_slip132.get_pubkey_from_path([0, 0]),
                          self._parse(BIP32_TEST_XPUB).get_pubkey_from_path([0, 0]))
 
@@ -395,7 +395,7 @@ class TestKeyParsing(unittest.TestCase):
         # A derived child stands for the whole key: the chaincode goes into it as much as the scalar
         under_slip132 = self._parse(BIP32_TEST_ZPRV)
 
-        self.assertIsNotNone(under_slip132.master_privkey)
+        self.assertIsNotNone(under_slip132.privkey)
         self.assertEqual(under_slip132.get_pubkey_from_path([0, 0]),
                          self._parse(BIP32_TEST_XPRIV).get_pubkey_from_path([0, 0]))
 
@@ -435,7 +435,7 @@ class TestKeyParsing(unittest.TestCase):
     def test_a_standard_electrum_phrase_derives_the_key_electrum_derives(self) -> None:
         # Same words as BIP39 uses, salted with 'electrum' instead of 'mnemonic', which is a
         # whole other wallet. The key below is the one Electrum's own tests expect
-        self.assertEqual(self._parse(ELECTRUM_STANDARD).get_master_xpub(), ELECTRUM_STANDARD_XPUB)
+        self.assertEqual(self._parse(ELECTRUM_STANDARD).get_xpub(), ELECTRUM_STANDARD_XPUB)
 
     def test_a_segwit_electrum_phrase_derives_the_key_electrum_derives(self) -> None:
         # Electrum writes this one under the SLIP-132 prefix that goes with the script type,
@@ -461,8 +461,8 @@ class TestKeyParsing(unittest.TestCase):
 
         expected = Mnemonic('english').to_seed(COLLIDING_PHRASE)
 
-        self.assertEqual(self._parse(COLLIDING_PHRASE).master_privkey,
-                         BIP32.from_seed(expected).master_privkey)
+        self.assertEqual(self._parse(COLLIDING_PHRASE).privkey,
+                         BIP32.from_seed(expected).privkey)
 
     def test_reading_it_both_ways_is_said_out_loud(self) -> None:
         output = io.StringIO()
@@ -478,7 +478,7 @@ class TestKeyParsing(unittest.TestCase):
             as_electrum = indy.parse_key(COLLIDING_PHRASE, '', prefer_electrum=True)
             as_bip39 = indy.parse_key(COLLIDING_PHRASE, '')
 
-        self.assertNotEqual(as_electrum.master_privkey, as_bip39.master_privkey)
+        self.assertNotEqual(as_electrum.privkey, as_bip39.privkey)
 
     def test_only_one_of_the_two_factor_versions_answers_to_a_word_count(self) -> None:
         # Electrum counts the words of the legacy one alone. The segwit one is two-factor at
@@ -515,8 +515,8 @@ class TestKeyParsing(unittest.TestCase):
         expected = hashlib.pbkdf2_hmac('sha512', FIFTEEN_WORDS_READING_AS_STANDARD.encode(),
                                        b'electrum', 2048)
 
-        self.assertEqual(self._parse(FIFTEEN_WORDS_READING_AS_STANDARD).master_privkey,
-                         BIP32.from_seed(expected).master_privkey)
+        self.assertEqual(self._parse(FIFTEEN_WORDS_READING_AS_STANDARD).privkey,
+                         BIP32.from_seed(expected).privkey)
 
     def test_a_phrase_written_without_spaces_between_its_characters(self) -> None:
         # Electrum drops the space between two Japanese or Chinese characters before weighing
@@ -528,12 +528,12 @@ class TestKeyParsing(unittest.TestCase):
     def test_an_electrum_phrase_is_read_however_it_is_written(self) -> None:
         # Electrum settles the case and the spacing of a phrase before it does anything with
         # the words, so the same phrase written another way is the same wallet
-        canonical = self._parse(ELECTRUM_STANDARD).master_privkey
+        canonical = self._parse(ELECTRUM_STANDARD).privkey
 
         for spelling in [ELECTRUM_STANDARD.upper(), ELECTRUM_STANDARD.replace(' ', '  ', 1),
                          '  ' + ELECTRUM_STANDARD + '\n', ELECTRUM_STANDARD.capitalize()]:
             with self.subTest(spelling=repr(spelling[:12])):
-                self.assertEqual(self._parse(spelling).master_privkey, canonical)
+                self.assertEqual(self._parse(spelling).privkey, canonical)
 
     def test_electrum_reads_a_phrase_with_its_marks_taken_off(self) -> None:
         # Its wordlists carry Spanish and Portuguese, where a word is written with a mark or
@@ -549,11 +549,11 @@ class TestKeyParsing(unittest.TestCase):
                 expected = hashlib.pbkdf2_hmac('sha512', ELECTRUM_STANDARD.encode(),
                                                b'electrum' + passphrase.encode(), 2048)
 
-                self.assertEqual(self._read(ELECTRUM_STANDARD, passphrase).master_privkey,
-                                 BIP32.from_seed(expected).master_privkey)
+                self.assertEqual(self._read(ELECTRUM_STANDARD, passphrase).privkey,
+                                 BIP32.from_seed(expected).privkey)
 
     def test_two_passphrases_open_two_electrum_wallets(self) -> None:
-        derived = {self._read(ELECTRUM_STANDARD, passphrase).master_privkey
+        derived = {self._read(ELECTRUM_STANDARD, passphrase).privkey
                    for passphrase in ['', 'una frase', 'otra']}
 
         self.assertEqual(len(derived), 3)
@@ -784,7 +784,7 @@ class TestSecretInput(unittest.TestCase):
             expected = indy.parse_key(mnemonic, 'a spoken passphrase')
 
         self.assertEqual(len(prompts), 1)
-        self.assertEqual(arguments[1].get_master_xpriv(), expected.get_master_xpriv())
+        self.assertEqual(arguments[1].get_xpriv(), expected.get_xpriv())
 
     def test_the_two_ways_of_giving_a_passphrase_are_alternatives(self) -> None:
         with self.assertRaises(SystemExit):
@@ -805,7 +805,7 @@ class TestSecretInput(unittest.TestCase):
             _, _, arguments = self._run([COLLIDING_PHRASE, '--electrum', '--host', 'example.invalid'])
             as_electrum = indy.parse_key(COLLIDING_PHRASE, '', prefer_electrum=True)
 
-        self.assertEqual(arguments[1].master_privkey, as_electrum.master_privkey)
+        self.assertEqual(arguments[1].privkey, as_electrum.privkey)
 
     def test_the_checksum_override_reaches_the_derivation(self) -> None:
         broken = TestKeyParsing.BROKEN_CHECKSUM
