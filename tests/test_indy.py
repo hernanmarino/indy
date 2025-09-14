@@ -46,6 +46,9 @@ BIP32_TEST_ZPUB = ('zpub6jftahH18ngZxUuv6oSniLNrBCSSE1B4EEU59bwTCEt8x6aS6b2mdfLx
 BIP48_PURPOSE = 48
 BIP84_PURPOSE = 84
 
+# Where the version bytes end and the rest of an extended key begins
+VERSION_LENGTH_IN_BYTES = 4
+
 # What a cosigner really exports, derived here at the BIP48 branches and written under the
 # four SLIP-132 prefixes that say the output is a multisig one
 COSIGNER_KEYS = [
@@ -67,6 +70,11 @@ CHAIN_XPUB = ('xpub6FF399gwcSoF77w6WNvjYUvFgkRmR7hNpqQyAfQoiNNFBLsswFVxwnQ6zafr2
               'GEYDoK98Hwq4wA8CVnRbH7yURcHTeWXiDSZ5v3jLCmaWns')
 COIN_TYPE_XPUB = ('xpub6AHmbjdVAckDYp68ymb93PxoLnX6s7BKQUju4PQWTh6AVzUXoJoq1yXTqMgSd'
                   'XfoMEbCZzvmLZeR5bMAExRaw9vxqzrvyFppkVhWXck85se')
+
+# A public payload written under the private prefix of its pair: SLIP-132 spells the two the
+# same but for the version bytes, so what the key is has to be read off the key and not those
+PUBLIC_PAYLOAD_UNDER_A_PRIVATE_PREFIX = ('zprvAWgYBBk7JR8GjzqSzmunMCS7dAbwpYTCs1YUMDXqduMA5JFHZ3iX5'
+                                         's2UkEv8Ltu5iLzWbvz1zD6C3QXDCPYVvhEPtnzLni5ZRgk4FJAL2zE')
 
 # A multisig prefix on a key of another depth: what it says is the script type, not the path
 COSIGNER_PREFIX_AT_ANOTHER_DEPTH = ('Zpub72ZuDw4QvRVPACwrLwK3no3MgcA7d7qz8MmVfKp5YPPbFcHncNy7n'
@@ -390,6 +398,32 @@ class TestKeyParsing(unittest.TestCase):
         self.assertIsNotNone(under_slip132.master_privkey)
         self.assertEqual(under_slip132.get_pubkey_from_path([0, 0]),
                          self._parse(BIP32_TEST_XPRIV).get_pubkey_from_path([0, 0]))
+
+    def test_another_prefix_is_rewritten_into_the_one_the_library_reads(self) -> None:
+        # SLIP-132 is mainnet under another four bytes, and only those four: the rewriting has
+        # to hand the payload across untouched, or the key read back is a different key
+        for under_slip132, plain in [(BIP32_TEST_ZPRV, BIP32_TEST_XPRIV),
+                                     (BIP32_TEST_ZPUB, BIP32_TEST_XPUB)]:
+            with self.subTest(key=under_slip132[:4]):
+                rewritten = indy._as_mainnet(under_slip132)
+
+                self.assertEqual(rewritten, plain)
+                self.assertEqual(base58.b58decode_check(rewritten)[VERSION_LENGTH_IN_BYTES:],
+                                 base58.b58decode_check(under_slip132)[VERSION_LENGTH_IN_BYTES:])
+
+    def test_a_key_already_written_for_mainnet_is_handed_back_as_it_came(self) -> None:
+        for key in [BIP32_TEST_XPRIV, BIP32_TEST_XPUB]:
+            with self.subTest(key=key[:4]):
+                self.assertEqual(indy._as_mainnet(key), key)
+
+    def test_which_prefix_it_is_rewritten_to_follows_what_the_key_carries(self) -> None:
+        # Which branch of the parsing a key takes is decided by the marker its payload begins
+        # with, so the rewriting has to read the same thing: a public payload under a private
+        # prefix goes to the public branch, and handing it an xprv there reads as no key at all
+        self.assertEqual(indy._as_mainnet(PUBLIC_PAYLOAD_UNDER_A_PRIVATE_PREFIX),
+                         BIP32_TEST_XPUB)
+        self.assertEqual(self._parse(PUBLIC_PAYLOAD_UNDER_A_PRIVATE_PREFIX).get_pubkey_from_path([0, 0]),
+                         self._parse(BIP32_TEST_XPUB).get_pubkey_from_path([0, 0]))
 
     def test_key_data_that_is_neither_private_nor_a_point_is_refused(self) -> None:
         for key in [BIP32_TEST_XPUB_MARKED_01, BIP32_TEST_XPUB_MARKED_FF,
