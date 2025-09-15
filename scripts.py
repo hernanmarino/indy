@@ -5,6 +5,7 @@ from typing import Optional, List, Tuple
 
 import base58
 import bech32
+import coincurve
 
 OP_0 = 0x00
 OP_1 = 0x51
@@ -33,6 +34,11 @@ MAX_WITNESS_PROGRAM_LENGTH_IN_BYTES = 40
 P2WPKH_PROGRAM_LENGTH_IN_BYTES = 20
 P2WSH_PROGRAM_LENGTH_IN_BYTES = 32
 
+# Taproot is witness version 1, and its program is the x coordinate of the key the output pays
+TAPROOT_WITNESS_VERSION = 1
+TAPTWEAK_TAG = 'TapTweak'
+X_ONLY_STARTS_AT = 1
+
 # The range of characters a bech32 string is made of
 MIN_BECH32_CHAR = 33
 MAX_BECH32_CHAR = 126
@@ -42,6 +48,31 @@ ripemd160 = lambda bytes: hashlib.new('ripemd160', bytes).digest()
 hash160 = lambda bytes: ripemd160(sha256(bytes))
 
 
+def tagged_hash(tag: str, data: bytes) -> bytes:
+    """
+    Hash under a tag, which is BIP340's way of keeping one hash from standing in for another.
+    """
+    # The tag is hashed and laid down twice, which costs nothing and leaves no way to craft
+    # data for one tag that hashes to what another tag would have produced
+    prefix = sha256(tag.encode())
+
+    return sha256(prefix + prefix + data)
+
+
+def taproot_output_key(internal_key: bytes) -> bytes:
+    """
+    The key a BIP86 output really pays, which is the derived one moved by a tweak.
+    """
+    # Spending by the key alone means there is no script tree, so the tweak commits to the
+    # internal key and nothing else. An output paying the internal key is spendable by
+    # whoever holds its scalar, but it is not the output BIP86 names, so no wallet built on
+    # that standard would ever look at it
+    point = coincurve.PublicKeyXOnly(internal_key)
+    point.tweak_add(tagged_hash(TAPTWEAK_TAG, internal_key))
+
+    return point.format()
+
+
 class ScriptType(Enum):
     """
     Single-key output script type.
@@ -49,6 +80,7 @@ class ScriptType(Enum):
     LEGACY = auto()  # P2PKH
     COMPAT = auto()  # P2SH of P2WPKH
     SEGWIT = auto()  # P2WPKH
+    TAPROOT = auto()  # P2TR, key path only
 
     def build_output_script(self, pubkey: bytes) -> bytes:
         """
@@ -64,6 +96,12 @@ class ScriptType(Enum):
         if self is ScriptType.SEGWIT:
             return _build_segwit_output_script(0, hash160(pubkey))
 
+        if self is ScriptType.TAPROOT:
+            # BIP340 keys are the x coordinate alone: the two compressed spellings of one
+            # point are one taproot output, so the prefix byte is dropped rather than hashed
+            return _build_segwit_output_script(TAPROOT_WITNESS_VERSION,
+                                               taproot_output_key(pubkey[X_ONLY_STARTS_AT:]))
+
         raise ValueError('Unrecognized address type')
 
     def build_input_script(self, pubkey: bytes, signature: bytes) -> bytes:
@@ -77,7 +115,7 @@ class ScriptType(Enum):
             script = _build_segwit_output_script(0, hash160(pubkey))
             return _build_p2sh_input_script(script)
 
-        if self is ScriptType.SEGWIT:
+        if self in [ScriptType.SEGWIT, ScriptType.TAPROOT]:
             return bytes()
 
         raise ValueError('Unrecognized address type')
@@ -91,6 +129,11 @@ class ScriptType(Enum):
 
         if self in [ScriptType.COMPAT, ScriptType.SEGWIT]:
             return [signature, pubkey]
+
+        if self is ScriptType.TAPROOT:
+            # The output names the key already, so repeating it would only be weight paid for,
+            # and a second item is what tells a node to look for a script path that is not there
+            return [signature]
 
         raise ValueError('Unrecognized address type')
 
