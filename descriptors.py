@@ -8,6 +8,16 @@ from bip32 import BIP32, HARDENED_INDEX
 
 from scripts import ScriptType
 
+# Where a key sits decides what hangs under it: a root has everything below hardened levels,
+# and an account key, three down, has its addresses in the two chains right under it
+ROOT_DEPTH = 0
+ACCOUNT_DEPTH = 3
+
+# What a path is counted from. Only a root is the master key these paths are written against,
+# so under anything else the leading m names a key that was never handed over
+MASTER_PREFIX = 'm'
+ACCOUNT_PREFIX = 'account'
+
 # m: master key
 # a: account index
 # i: address index
@@ -49,6 +59,19 @@ descriptors = {
     "m/84'/0'/2147483644'/0/i": [ScriptType.SEGWIT],  # Samourai bad-bank, external
     "m/84'/0'/2147483644'/1/i": [ScriptType.SEGWIT],  # Samourai bad-bank, change
 }
+
+
+def written_under(path: Path, depth: int) -> str:
+    """
+    Write a path naming what it hangs from, which is the key handed over and not always a root.
+    """
+    # The same two chains carry the addresses of an Electrum standard wallet under a root and
+    # the addresses of any wallet under the account key it exports. Written the same way,
+    # whoever copies one down later derives the other and finds an empty wallet
+    if depth == ROOT_DEPTH:
+        return path.path
+
+    return ACCOUNT_PREFIX + path.path[len(MASTER_PREFIX):]
 
 
 class Path:

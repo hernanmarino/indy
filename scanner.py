@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 import scripts
 import transactions
-from descriptors import Path, Script, ScriptIterator
+from descriptors import Path, Script, ScriptIterator, written_under
 from scripts import ScriptType
 
 MAX_BATCH_SIZE = 100
@@ -83,7 +83,8 @@ async def scan_master_key(
                 if len(response) == 0:
                     continue
 
-                path, type = script.path_with_account().path, script.type().name
+                path = written_under(script.path_with_account(), master_key.depth)
+                type = script.type().name
 
                 if (path, type) not in descriptors:
                     descriptors.add((path, type))
