@@ -72,6 +72,13 @@ def _script_hash_of(master_key: BIP32, path: str, script_type: ScriptType) -> st
     return scanner._electrum_script_hash(_program_of(master_key, path, script_type))
 
 
+def _reported_paths(output: str) -> Set[str]:
+    """
+    The paths a scan said it found used addresses at, read back off what it printed.
+    """
+    return {line.split('path=')[1].split(' ')[0] for line in output.splitlines() if 'path=' in line}
+
+
 def _server_for(master_key: BIP32, **options: object) -> 'FakeClient':
     """
     A server that reports the first address of the scan as used, and backs what it reports.
@@ -288,6 +295,79 @@ class TestRepeatedOutputs(unittest.TestCase):
                 utxos, _ = self._scan(should_batch, also_use_the_other=True)
 
                 self.assertEqual(sorted(utxo.path.path for utxo in utxos), [USED_PATH, self.OTHER_PATH])
+
+
+class TestWhatAPathHangsFrom(unittest.TestCase):
+    """
+    What the reported path is counted from, which is the key that was handed over and not
+    always the master one.
+    """
+
+    # Where an account key keeps its addresses, and where an Electrum standard wallet keeps
+    # its own: the same two paths, written the same way, off keys three levels apart
+    ACCOUNT_PATH = "m/84'/0'/0'"
+    SHARED_PATH = 'm/0/0'
+
+    def _scan_finding(self, key: BIP32, path: str) -> str:
+        captured = io.StringIO()
+        client = FakeClient({_script_hash_of(key, path, USED_TYPE)},
+                            program=_program_of(key, path, USED_TYPE))
+
+        async def scan() -> List[scanner.Utxo]:
+            return await scanner.scan_master_key(client, key, 20, 0, True)
+
+        with redirect_stdout(captured), redirect_stderr(captured):
+            asyncio.run(scan())
+
+        return captured.getvalue()
+
+    def _account_key(self) -> BIP32:
+        root = BIP32.from_seed(BIP32_TEST_SEED)
+
+        return BIP32.from_xpub(root.get_xpub_from_path(Path(self.ACCOUNT_PATH).to_list()))
+
+    def test_the_same_two_addresses_are_not_reported_the_same_way(self) -> None:
+        # m/0/0 off a root and m/0/0 off an account key are different addresses. Written the
+        # same, whoever copies one down restores the wrong wallet and finds it empty
+        root = BIP32.from_seed(BIP32_TEST_SEED)
+
+        self.assertNotEqual(root.get_pubkey_from_path([0, 0]),
+                            self._account_key().get_pubkey_from_path([0, 0]))
+
+        from_root = self._scan_finding(root, self.SHARED_PATH)
+        from_account = self._scan_finding(self._account_key(), self.SHARED_PATH)
+
+        self.assertNotEqual(_reported_paths(from_root), _reported_paths(from_account))
+
+    def test_a_path_off_a_root_is_written_from_the_master(self) -> None:
+        reported = _reported_paths(self._scan_finding(BIP32.from_seed(BIP32_TEST_SEED), self.SHARED_PATH))
+
+        self.assertIn('m/0/i', reported)
+
+    def test_a_path_off_an_account_key_says_so_instead(self) -> None:
+        # There is no m above it that this knows, so calling the top of the path m would name
+        # a key that was never handed over
+        reported = _reported_paths(self._scan_finding(self._account_key(), self.SHARED_PATH))
+
+        self.assertEqual(reported, {'account/0/i'})
+        self.assertNotIn('m/0/i', reported)
+
+    def test_what_is_printed_moves_and_what_is_derived_from_does_not(self) -> None:
+        # The path an unspent output carries is handed straight back to the key it came from,
+        # so renaming what it hangs from for the reader must not reach it
+        key = self._account_key()
+        client = FakeClient({_script_hash_of(key, self.SHARED_PATH, USED_TYPE)},
+                            program=_program_of(key, self.SHARED_PATH, USED_TYPE))
+
+        async def scan() -> List[scanner.Utxo]:
+            return await scanner.scan_master_key(client, key, 20, 0, True)
+
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            utxos = asyncio.run(scan())
+
+        self.assertEqual(utxos[0].path.path, self.SHARED_PATH)
+        self.assertEqual(key.get_pubkey_from_path(utxos[0].path.to_list()),
+                         key.get_pubkey_from_path([0, 0]))
 
 
 class TestScanWithoutATerminal(unittest.TestCase):

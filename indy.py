@@ -23,6 +23,7 @@ from mnemonic import Mnemonic
 import scanner
 import scripts
 import transactions
+from descriptors import ACCOUNT_DEPTH, ROOT_DEPTH
 
 # Offered to the server as a range, since not every server speaks the newest protocol
 ELECTRUM_PROTOCOL_VERSIONS = ['1.4', '1.4.2']
@@ -55,11 +56,6 @@ SCRIPT_TYPE_COLUMN = 10
 # Electrum counts from BIP48 only for a BIP39 seed. Its own seeds go elsewhere: a standard one
 # makes the root itself the key a cosigner hands over, and a segwit one the branch at m/1'
 ELECTRUM_MULTISIG_BRANCH = 1
-
-# Where a key sits decides what hangs under it: a root has everything below hardened levels,
-# and an account key, three down, has its addresses in the two chains right under it
-ROOT_DEPTH = 0
-ACCOUNT_DEPTH = 3
 
 # Electrum writes its phrases with the same words as BIP39 and tells its own apart by a version
 # it works out of them. The two kinds it makes today are a standard wallet and a segwit one; the
