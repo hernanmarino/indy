@@ -38,10 +38,12 @@ multisig or lightning wallet, then you cannot recover the funds with just the mn
 
 A multisig cannot even be searched for: its addresses are built from every cosigner at once,
 so one seed derives none of them, and every scan says as much. Recovering one takes the keys
-BIP48 puts that wallet under, the other cosigners' keys, and how many of them must sign.
-`--show-multisig-keys` prints the first of those, for account 0, the one a wallet opens
-with, and only a private root holds them. They are kept back otherwise: an xpub spends
-nothing, but it hands every address of those branches to whoever reads it.
+that wallet is built on, the other cosigners' keys, and how many of them must sign.
+`--show-multisig-keys` prints the first of those, and only a private root holds them. Which
+keys those are depends on the seed: BIP48 puts them under account 0, and an Electrum seed
+phrase does not follow BIP48 at all, so for one of those the keys of its own convention are
+printed instead. They are kept back otherwise: an xpub spends nothing, but it hands every
+address of those branches to whoever reads it.
 
 ## Installation
 ```
@@ -89,9 +91,9 @@ options:
                         match
   --electrum            read the phrase as Electrum's when it reads as BIP39
                         as well
-  --show-multisig-keys  print the BIP48 keys of account 0 that a private root
-                        holds, which reveal the addresses of those branches to
-                        whoever reads them
+  --show-multisig-keys  print the multisig keys a private root holds, under
+                        BIP48 or under Electrum's own convention, which reveal
+                        the addresses of those branches to whoever reads them
 
 sweep transaction:
   --address <address>   craft a transaction sending all funds to this address

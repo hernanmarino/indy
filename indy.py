@@ -10,7 +10,7 @@ import os
 import random
 import unicodedata
 from decimal import Decimal
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import base58
 import coincurve
@@ -51,6 +51,10 @@ MAINNET_COIN_TYPE = 0
 MULTISIG_ACCOUNT = 0
 MULTISIG_BRANCHES = [(1, 'P2SH-P2WSH'), (2, 'P2WSH')]
 SCRIPT_TYPE_COLUMN = 10
+
+# Electrum counts from BIP48 only for a BIP39 seed. Its own seeds go elsewhere: a standard one
+# makes the root itself the key a cosigner hands over, and a segwit one the branch at m/1'
+ELECTRUM_MULTISIG_BRANCH = 1
 
 # Where a key sits decides what hangs under it: a root has everything below hardened levels,
 # and an account key, three down, has its addresses in the two chains right under it
@@ -112,9 +116,9 @@ def main():
     parser.add_argument('--electrum', default=False, action='store_true',
                         help='read the phrase as Electrum\'s when it reads as BIP39 as well')
     parser.add_argument('--show-multisig-keys', default=False, action='store_true',
-                        help='print the BIP48 keys of account 0 that a private root holds, '
-                             'which reveal the addresses of those branches to whoever reads '
-                             'them')
+                        help='print the multisig keys a private root holds, under BIP48 or '
+                             'under Electrum\'s own convention, which reveal the addresses of '
+                             'those branches to whoever reads them')
 
     sweep_tx = parser.add_argument_group('sweep transaction')
 
@@ -161,7 +165,10 @@ def main():
     key = _read_key(args.key)
     passphrase = _read_passphrase(args.passphrase, args.ask_passphrase)
 
-    master_key = parse_key(key, passphrase, args.allow_invalid_checksum, args.electrum)
+    # The version travels with the key rather than being worked out again here: the version
+    # is an HMAC of the text, which any string has, and about one in two hundred and fifty
+    # six lands on a prefix by chance. Only the parsing knows the input was read as a phrase
+    master_key, electrum_version = parse_key(key, passphrase, args.allow_invalid_checksum, args.electrum)
 
     if args.host is not None:
         port = (args.protocol + str(args.port)) if args.port else args.protocol
@@ -182,7 +189,8 @@ def main():
         args.allow_high_fee,
         args.yes,
         args.insecure,
-        args.show_multisig_keys
+        args.show_multisig_keys,
+        electrum_version
     ))
 
 
@@ -457,9 +465,12 @@ def _is_private_key(key: str) -> bool:
 
 
 def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False,
-              prefer_electrum: bool = False) -> BIP32:
+              prefer_electrum: bool = False) -> Tuple[BIP32, Optional[str]]:
     """
     Try to parse an extended key, whether it is in xpub, xpriv or mnemonic format.
+
+    Hands back the key and, when the input was read as an Electrum phrase, the version it
+    carries, which is what says where a wallet grown from it would keep a multisig.
     """
     if _is_of_another_chain(key):
         raise ValueError(
@@ -488,7 +499,7 @@ def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False,
             # though the refusal came from somewhere else
             placed = _placed(private_key)
             print('🔑  Read private key successfully')
-            return placed
+            return placed, None
 
     if _is_public_key(key):
         try:
@@ -501,7 +512,7 @@ def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False,
             # though the refusal came from somewhere else
             placed = _placed(public_key)
             print('🔑  Read public key successfully')
-            return placed
+            return placed, None
 
     electrum_version = _electrum_version_of(key)
 
@@ -525,7 +536,7 @@ def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False,
     if electrum_version is not None:
         private_key = BIP32.from_seed(_electrum_seed(key, passphrase))
         print('🔑  Read Electrum seed phrase successfully')
-        return private_key
+        return private_key, electrum_version
 
     if _is_a_mnemonic(key):
         # A phrase arrives with whatever spacing the document it was copied out of had, and the
@@ -543,7 +554,7 @@ def parse_key(key: str, passphrase: str, allow_invalid_checksum: bool = False,
         seed = Mnemonic.to_seed(words, passphrase=passphrase)
         private_key = BIP32.from_seed(seed)
         print('🔑  Read mnemonic successfully')
-        return private_key
+        return private_key, None
 
     raise ValueError('The key is invalid or the format isn\'t recognized. Make sure it\'s a mnemonic, xpriv or xpub.')
 
@@ -566,10 +577,34 @@ def _report_what_a_public_key_reaches(master_key: BIP32) -> None:
     print('    bring the account xpub, which is the one a wallet exports')
 
 
-def _report_multisig_keys(master_key: BIP32, should_show_keys: bool) -> None:
+def _multisig_keys_of(electrum_version: Optional[str]) -> Tuple[str, List[Tuple[List[int], str, str]]]:
+    """
+    Where a wallet grown from this seed keeps a multisig, and which keys hang there.
+    """
+    # Which standard applies is decided by the seed, not by the key: a root derived from an
+    # Electrum phrase and one derived from a BIP39 phrase look the same and are asked for at
+    # different paths, so handing over the BIP48 ones either way rebuilds somebody else's wallet
+    if electrum_version == ELECTRUM_STANDARD_VERSION:
+        return 'Electrum puts a multisig of these words under', [([], 'm', 'P2SH')]
+
+    if electrum_version == ELECTRUM_SEGWIT_VERSION:
+        return ('Electrum puts a multisig of these words under',
+                [([ELECTRUM_MULTISIG_BRANCH + HARDENED_INDEX], f"m/{ELECTRUM_MULTISIG_BRANCH}'", 'P2WSH')])
+
+    return (f'BIP48 puts account {MULTISIG_ACCOUNT} of such a wallet under',
+            [([BIP48_PURPOSE + HARDENED_INDEX, MAINNET_COIN_TYPE + HARDENED_INDEX,
+               MULTISIG_ACCOUNT + HARDENED_INDEX, branch + HARDENED_INDEX],
+              f"m/{BIP48_PURPOSE}'/{MAINNET_COIN_TYPE}'/{MULTISIG_ACCOUNT}'/{branch}'", script_type)
+             for branch, script_type in MULTISIG_BRANCHES])
+
+
+def _report_multisig_keys(master_key: BIP32, should_show_keys: bool,
+                          electrum_version: Optional[str] = None) -> None:
     """
     Say what a multisig of this seed would take, and hand over its keys if they were asked for.
     """
+    where, branches = _multisig_keys_of(electrum_version)
+
     print()
     print('🔑  A multisig wallet cannot be searched for from one seed: its addresses are built')
     print('    from every cosigner at once, so this scan says nothing either way about one')
@@ -582,23 +617,21 @@ def _report_multisig_keys(master_key: BIP32, should_show_keys: bool) -> None:
         return
 
     if master_key.depth != ROOT_DEPTH:
-        print(f'    BIP48 counts its levels from the root, and this key is {master_key.depth} under one, so')
-        print('    its keys take the seed phrase or the root xpriv')
+        print(f'    Those levels are counted from the root, and this key is {master_key.depth} under one,')
+        print('    so its keys take the seed phrase or the root xpriv')
         return
 
     if not should_show_keys:
-        print(f'    Pass `--show-multisig-keys` for the BIP48 keys of account {MULTISIG_ACCOUNT}')
+        print(f'    Pass `--show-multisig-keys` for the keys {where}')
         return
 
     print('    What is missing is the other cosigners\' keys and how many must sign, along')
-    print(f'    with these, which BIP48 puts account {MULTISIG_ACCOUNT} of such a wallet under:')
+    print(f'    with these, which {where}:')
 
-    for branch, script_type in MULTISIG_BRANCHES:
-        path = [BIP48_PURPOSE + HARDENED_INDEX, MAINNET_COIN_TYPE + HARDENED_INDEX,
-                MULTISIG_ACCOUNT + HARDENED_INDEX, branch + HARDENED_INDEX]
-        spelled = f"m/{BIP48_PURPOSE}'/{MAINNET_COIN_TYPE}'/{MULTISIG_ACCOUNT}'/{branch}'"
+    for path, spelled, script_type in branches:
+        written = master_key.get_xpub_from_path(path) if path else master_key.get_xpub()
 
-        print(f'    {spelled}  {script_type:{SCRIPT_TYPE_COLUMN}}  {master_key.get_xpub_from_path(path)}')
+        print(f'    {spelled}  {script_type:{SCRIPT_TYPE_COLUMN}}  {written}')
 
 
 async def find_utxos(
@@ -613,7 +646,8 @@ async def find_utxos(
         allow_high_fee: bool = False,
         assume_yes: bool = False,
         insecure: bool = False,
-        show_multisig_keys: bool = False
+        show_multisig_keys: bool = False,
+        electrum_version: Optional[str] = None
 ):
     """
     Connect to an electrum server and find every UTXO a key reaches, spendable or not.
@@ -637,14 +671,14 @@ async def find_utxos(
 
     if len(utxos) == 0:
         print('😔  Didn\'t find any unspent outputs')
-        _report_multisig_keys(master_key, show_multisig_keys)
+        _report_multisig_keys(master_key, show_multisig_keys, electrum_version)
         client.close()
         return
 
     balance = sum([utxo.amount_in_sat for utxo in utxos])
     print(f'💸  Total spendable balance found: {balance} sats')
 
-    _report_multisig_keys(master_key, show_multisig_keys)
+    _report_multisig_keys(master_key, show_multisig_keys, electrum_version)
 
     if master_key.privkey is None:
         print('✍️  Re-run with a private key to create a sweep transaction')

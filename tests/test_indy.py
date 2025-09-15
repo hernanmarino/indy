@@ -46,6 +46,15 @@ BIP32_TEST_ZPUB = ('zpub6jftahH18ngZxUuv6oSniLNrBCSSE1B4EEU59bwTCEt8x6aS6b2mdfLx
 BIP48_PURPOSE = 48
 BIP84_PURPOSE = 84
 
+# The versions Electrum works out of its own phrases, spelled here rather than imported
+ELECTRUM_STANDARD_VERSION = '01'
+ELECTRUM_SEGWIT_VERSION = '100'
+
+# A root xpriv whose text happens to hash to the Electrum standard prefix. The version is an
+# HMAC of whatever was typed, so about one string in two hundred and fifty six lands on one
+COLLIDING_XPRIV = ('xprv9s21ZrQH143K4WmywJ6uVRY76LHtUMxbg5fyyRRiBXNyXUJoL1N5MLpeJo1KY'
+                   'NgbLCo6GA6YziRsz2XVR5yrmbetKKoTmeLNStVxNQTHDxT')
+
 # Where the version bytes end and the rest of an extended key begins
 VERSION_LENGTH_IN_BYTES = 4
 
@@ -241,11 +250,11 @@ class TestKeyParsing(unittest.TestCase):
 
     def _parse(self, key: str, **options: object) -> object:
         with redirect_stdout(io.StringIO()):
-            return indy.parse_key(key, '', **options)
+            return indy.parse_key(key, '', **options)[0]
 
     def _read(self, key: str, passphrase: str) -> BIP32:
         with redirect_stdout(io.StringIO()):
-            return indy.parse_key(key, passphrase)
+            return indy.parse_key(key, passphrase)[0]
 
     def test_a_mnemonic_that_checks_out_is_read(self) -> None:
         self.assertIsNotNone(self._parse(self.VALID))
@@ -501,8 +510,8 @@ class TestKeyParsing(unittest.TestCase):
 
     def test_the_other_reading_can_be_asked_for(self) -> None:
         with redirect_stdout(io.StringIO()):
-            as_electrum = indy.parse_key(COLLIDING_PHRASE, '', prefer_electrum=True)
-            as_bip39 = indy.parse_key(COLLIDING_PHRASE, '')
+            as_electrum, _ = indy.parse_key(COLLIDING_PHRASE, '', prefer_electrum=True)
+            as_bip39, _ = indy.parse_key(COLLIDING_PHRASE, '')
 
         self.assertNotEqual(as_electrum.privkey, as_bip39.privkey)
 
@@ -807,7 +816,7 @@ class TestSecretInput(unittest.TestCase):
                                           typed=['a spoken passphrase'])
 
         with redirect_stdout(io.StringIO()):
-            expected = indy.parse_key(mnemonic, 'a spoken passphrase')
+            expected, _ = indy.parse_key(mnemonic, 'a spoken passphrase')
 
         self.assertEqual(len(prompts), 1)
         self.assertEqual(arguments[1].get_xpriv(), expected.get_xpriv())
@@ -823,13 +832,16 @@ class TestSecretInput(unittest.TestCase):
         _, _, with_them = self._run([BIP32_TEST_XPRIV, '--show-multisig-keys',
                                      '--host', 'example.invalid'])
 
-        self.assertEqual(without[-1], False)
-        self.assertEqual(with_them[-1], True)
+        # Named rather than counted from the end, so that another argument does not slip past
+        show_multisig_keys_at = 11
+
+        self.assertEqual(without[show_multisig_keys_at], False)
+        self.assertEqual(with_them[show_multisig_keys_at], True)
 
     def test_reading_a_phrase_as_electrum_reaches_the_derivation(self) -> None:
         with redirect_stdout(io.StringIO()):
             _, _, arguments = self._run([COLLIDING_PHRASE, '--electrum', '--host', 'example.invalid'])
-            as_electrum = indy.parse_key(COLLIDING_PHRASE, '', prefer_electrum=True)
+            as_electrum, _ = indy.parse_key(COLLIDING_PHRASE, '', prefer_electrum=True)
 
         self.assertEqual(arguments[1].privkey, as_electrum.privkey)
 
@@ -1227,7 +1239,7 @@ class TestMultisigKeys(unittest.TestCase):
     """
 
     def _run(self, key: BIP32, utxos: Optional[List[scanner.Utxo]] = None,
-             should_show_keys: bool = True) -> str:
+             should_show_keys: bool = True, electrum_version: Optional[str] = None) -> str:
         output = io.StringIO()
 
         class FakeClient:
@@ -1254,7 +1266,8 @@ class TestMultisigKeys(unittest.TestCase):
              mock.patch.object(scanner, 'scan_master_key', scan):
             with redirect_stdout(output):
                 asyncio.run(indy.find_utxos(TEST_SERVER, key, 20, 0, None, None, False, True,
-                                            show_multisig_keys=should_show_keys))
+                                            show_multisig_keys=should_show_keys,
+                                            electrum_version=electrum_version))
 
         return output.getvalue()
 
@@ -1280,6 +1293,85 @@ class TestMultisigKeys(unittest.TestCase):
                                                        HARDENED_INDEX, script + HARDENED_INDEX])
 
                 self.assertIn(expected, output)
+
+    def test_an_electrum_seed_is_given_the_keys_electrum_uses(self) -> None:
+        # Electrum only counts from BIP48 when the seed handed to it is a BIP39 one. Its own
+        # seeds go elsewhere: a standard one makes the root itself the cosigner key, and a
+        # segwit one the branch at m/1'. BIP48 keys would rebuild a wallet that never existed
+        for version, path in [(ELECTRUM_STANDARD_VERSION, []),
+                              (ELECTRUM_SEGWIT_VERSION, [1 + HARDENED_INDEX])]:
+            with self.subTest(version=version):
+                private = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+                output = self._run(private, electrum_version=version)
+
+                self.assertIn(private.get_xpub_from_path(path) if path else private.get_xpub(), output)
+
+    def test_bip48_is_not_offered_to_an_electrum_seed(self) -> None:
+        # Saying BIP48 to a wallet that does not use it is the failure this whole report is
+        # meant to avoid, one step further along: keys that rebuild somebody else's wallet
+        private = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+
+        for version in [ELECTRUM_STANDARD_VERSION, ELECTRUM_SEGWIT_VERSION]:
+            with self.subTest(version=version):
+                output = self._run(private, electrum_version=version)
+
+                self.assertNotIn('48', output)
+                self.assertIn('Electrum', output)
+
+                for script in [1, 2]:
+                    self.assertNotIn(private.get_xpub_from_path([BIP48_PURPOSE + HARDENED_INDEX,
+                                                                 HARDENED_INDEX, HARDENED_INDEX,
+                                                                 script + HARDENED_INDEX]), output)
+
+    def test_a_key_whose_text_hashes_to_a_prefix_is_not_a_phrase(self) -> None:
+        # The version is an HMAC of whatever was typed, and every string has one. Reading it
+        # off an input the parsing already took as a key would hand a root xpriv the keys of
+        # a wallet it has nothing to do with, about one time in two hundred and fifty six
+        with redirect_stdout(io.StringIO()) as output:
+            read, version = indy.parse_key(COLLIDING_XPRIV, '')
+
+        self.assertIn('Read private key', output.getvalue())
+        self.assertIsNone(version)
+        self.assertEqual(indy._electrum_version_of(COLLIDING_XPRIV), ELECTRUM_STANDARD_VERSION)
+        self.assertIn('BIP48', self._run(read, electrum_version=version))
+
+    def test_each_electrum_key_is_printed_under_the_path_and_type_it_belongs_to(self) -> None:
+        # Three columns get copied into a multisig tool, and a key on the wrong line rebuilds
+        # the wrong wallet just as surely as the wrong key does
+        private = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+        expected = {
+            ELECTRUM_STANDARD_VERSION: ('m', 'P2SH', private.get_xpub()),
+            ELECTRUM_SEGWIT_VERSION: ("m/1'", 'P2WSH', private.get_xpub_from_path([1 + HARDENED_INDEX])),
+        }
+
+        for version, (spelled, script_type, key) in expected.items():
+            with self.subTest(version=version):
+                rows = [line.split() for line in self._run(private, electrum_version=version).splitlines()
+                        if line.startswith('    m')]
+
+                self.assertEqual(rows, [[spelled, script_type, key]])
+
+    def test_the_two_electrum_kinds_are_not_given_the_same_keys(self) -> None:
+        private = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+
+        self.assertNotEqual(self._run(private, electrum_version=ELECTRUM_STANDARD_VERSION),
+                            self._run(private, electrum_version=ELECTRUM_SEGWIT_VERSION))
+
+    def test_the_offer_names_the_standard_the_keys_come_from(self) -> None:
+        # Whoever reads it has to be able to tell that these are not their wallet's keys, and
+        # the name of the standard is the only thing in the line that says so
+        private = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+
+        self.assertIn('Electrum', self._run(private, should_show_keys=False,
+                                            electrum_version=ELECTRUM_SEGWIT_VERSION))
+        self.assertIn('BIP48', self._run(private, should_show_keys=False))
+
+    def test_a_bip39_mnemonic_is_still_given_the_bip48_keys(self) -> None:
+        private = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+        output = self._run(private)
+
+        self.assertIn('BIP48', output)
+        self.assertNotIn('Electrum', output)
 
     def test_it_says_what_is_missing_to_use_them(self) -> None:
         output = self._run(BIP32.from_xpriv(BIP32_TEST_XPRIV))
@@ -1317,7 +1409,7 @@ class TestMultisigKeys(unittest.TestCase):
     def test_the_keys_are_mainnet_whatever_prefix_the_key_arrived_under(self) -> None:
         # The library reads anything but xprv or xpub as testnet, and SLIP-132 is neither
         with redirect_stdout(io.StringIO()):
-            under_slip132 = indy.parse_key(BIP32_TEST_ZPRV, '')
+            under_slip132, _ = indy.parse_key(BIP32_TEST_ZPRV, '')
 
         output = self._run(under_slip132)
 
@@ -1352,7 +1444,7 @@ class TestMultisigKeys(unittest.TestCase):
         root = BIP32.from_xpriv(BIP32_TEST_XPRIV)
 
         with redirect_stdout(io.StringIO()):
-            under_slip132 = indy.parse_key(BIP32_TEST_ZPRV, '')
+            under_slip132, _ = indy.parse_key(BIP32_TEST_ZPRV, '')
 
         self.assertIn(root.get_xpub_from_path([BIP48_PURPOSE + HARDENED_INDEX, HARDENED_INDEX,
                                                HARDENED_INDEX, 1 + HARDENED_INDEX]),
@@ -1736,6 +1828,36 @@ class TestEventLoop(unittest.TestCase):
                 indy.main()
 
         self.assertEqual(len(started), 1)
+
+    def test_what_kind_of_seed_was_read_reaches_the_scan(self) -> None:
+        # Which standard a multisig of this seed follows is decided by the words, and the
+        # report that hands those keys over runs at the far end of the scan, so the answer
+        # has to travel: a root out of an Electrum phrase and one out of a BIP39 phrase are
+        # the same object and are asked for at different paths
+        captured = []
+
+        async def find_utxos(*args: object) -> None:
+            captured.append(args)
+
+        electrum_version_at = 12
+
+        for key, flags, expected in [(ELECTRUM_SEGWIT, [], ELECTRUM_SEGWIT_VERSION),
+                                     (ELECTRUM_STANDARD, [], ELECTRUM_STANDARD_VERSION),
+                                     (BIP32_TEST_XPRIV, [], None),
+                                     (COLLIDING_XPRIV, [], None),
+                                     (COLLIDING_PHRASE, [], None),
+                                     (COLLIDING_PHRASE, ['--electrum'], ELECTRUM_STANDARD_VERSION)]:
+            with self.subTest(key=key[:12], flags=flags):
+                captured.clear()
+                asyncio.set_event_loop(None)
+                command = ['indy.py', key, '--host', 'example.invalid'] + flags
+
+                with mock.patch.object(indy, 'find_utxos', find_utxos), \
+                     mock.patch.object(sys, 'argv', command):
+                    with redirect_stdout(io.StringIO()):
+                        indy.main()
+
+                self.assertEqual(captured[0][electrum_version_at], expected)
 
     def test_the_sweep_flags_reach_the_scan(self) -> None:
         captured = []
