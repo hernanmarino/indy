@@ -24,11 +24,16 @@ descriptors = {
     "m/49'/0'/a'/1/i": [ScriptType.COMPAT],  # BIP49, change
     "m/84'/0'/a'/0/i": [ScriptType.SEGWIT],  # BIP84, external
     "m/84'/0'/a'/1/i": [ScriptType.SEGWIT],  # BIP84, change
+    # Taproot, which Sparrow, Ledger, Trezor and Wasabi hand out today, and which every one
+    # of them puts under BIP86: the purpose says the script type, so nothing else is looked
+    # for here and this is not looked for under the purposes that predate it
+    "m/86'/0'/a'/0/i": [ScriptType.TAPROOT],  # BIP86, external
+    "m/86'/0'/a'/1/i": [ScriptType.TAPROOT],  # BIP86, change
     "m/0'/0'/i'": [ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.SEGWIT],  # Bitcoin Core
     # Addresses that hang off the key itself, with nothing in between: an Electrum standard
     # wallet keeps its own there, and so does whatever account key a wallet exports
-    'm/0/i': [ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.SEGWIT],  # external
-    'm/1/i': [ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.SEGWIT],  # change
+    'm/0/i': [ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.SEGWIT, ScriptType.TAPROOT],  # external
+    'm/1/i': [ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.SEGWIT, ScriptType.TAPROOT],  # change
     "m/0'/0/i": [ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.SEGWIT],  # BRD/Hodl/Coin/Multibit external
     "m/0'/1/i": [ScriptType.LEGACY, ScriptType.COMPAT, ScriptType.SEGWIT],  # BRD/Hodl/Coin/Multibit change
     "m/44'/0'/2147483647'/0/i": [ScriptType.LEGACY],  # Samourai ricochet, BIP44, external

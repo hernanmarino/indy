@@ -90,6 +90,24 @@ def _scan(
     }
 
 
+def _walk(max_scripts: int) -> List[Tuple[str, str, int, int]]:
+    """
+    Every descriptor the iterator yields, with nothing marked as used along the way.
+    """
+    iterator = ScriptIterator(_master_key(), 20, 0)
+    walked = []
+
+    while len(walked) < max_scripts:
+        script = iterator.next_script()
+
+        if not script:
+            return walked
+
+        walked.append((script.descriptor.path.path, script.type().name, script.index, script.account))
+
+    raise AssertionError(f'The walk did not end within {max_scripts} scripts')
+
+
 class TestPath(unittest.TestCase):
     """
     Derivation path with optional account and index placeholders.
@@ -338,13 +356,38 @@ class TestScriptIterator(unittest.TestCase):
         # What a wallet exports is the key of its account, and its addresses hang off that at
         # m/0/i and m/1/i whichever script type it spends to
         for chain in [0, 1]:
-            for script_type in ['LEGACY', 'COMPAT', 'SEGWIT']:
+            for script_type in ['LEGACY', 'COMPAT', 'SEGWIT', 'TAPROOT']:
                 with self.subTest(chain=chain, script_type=script_type):
                     address = f'm/{chain}/0'
                     result = _scan({(address, script_type)}, batch_size=MAX_BATCH_SIZE, max_scripts=6_000)
 
                     self.assertTrue(result['terminated'])
                     self.assertEqual(result['found'], [(address, script_type)])
+
+    def test_the_bip86_path_is_scanned_for_taproot(self) -> None:
+        # Taproot addresses are what Sparrow, Ledger and Trezor hand out today, and BIP86 is
+        # the path every one of them puts them under
+        for chain in [0, 1]:
+            with self.subTest(chain=chain):
+                address = f"m/86'/0'/0'/{chain}/0"
+                result = _scan({(address, 'TAPROOT')}, batch_size=MAX_BATCH_SIZE, max_scripts=6_000)
+
+                self.assertTrue(result['terminated'])
+                self.assertEqual(result['found'], [(address, 'TAPROOT')])
+
+    def test_the_bip86_path_is_not_scanned_with_the_other_script_types(self) -> None:
+        # A purpose says which script type its addresses are, and looking for the other three
+        # under BIP86 would be three requests a wallet never paid to, on every index
+        walked = {(path, script_type) for path, script_type, _, _ in _walk(max_scripts=60_000)}
+
+        self.assertEqual({script_type for path, script_type in walked if path.startswith("m/86'")},
+                         {'TAPROOT'})
+
+    def test_taproot_is_not_looked_for_under_the_purposes_that_predate_it(self) -> None:
+        walked = {(path, script_type) for path, script_type, _, _ in _walk(max_scripts=60_000)}
+        taproot_paths = {path for path, script_type in walked if script_type == 'TAPROOT'}
+
+        self.assertEqual(taproot_paths, {"m/86'/0'/a'/0/i", "m/86'/0'/a'/1/i", 'm/0/i', 'm/1/i'})
 
     def test_a_public_key_walks_the_paths_it_can_derive(self) -> None:
         # A hardened level cannot be derived from a public key, so those paths are left out
