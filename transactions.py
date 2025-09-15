@@ -16,6 +16,16 @@ SEQUENCE = 0xffff_ffff
 LOCKTIME = 0x0000_0000
 SIGHASH_ALL = 0x01
 
+# Taproot signs over a single sha256 under a tag, and says nothing about the hash type when
+# it is the default one. The spend type is nought here: no annex, and the key path, not a script
+SIGHASH_DEFAULT = 0x00
+TAPSIGHASH_TAG = 'TapSighash'
+TAPROOT_EPOCH = 0x00
+TAPROOT_KEY_PATH_SPEND_TYPE = 0x00
+CURVE_ORDER = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_fffe_baae_dce6_af48_a03b_bfd2_5e8c_d036_4141
+SCALAR_LENGTH_IN_BYTES = 32
+ODD_Y_PREFIX = 0x03
+
 NON_SEGWIT_DUST = 546
 
 
@@ -38,12 +48,37 @@ class Transaction:
         self.outputs = [(amount_in_sat, output_script)]
         self.inputs = []
 
+        # A taproot digest covers every input's amount and the script each one pays, so all of
+        # them are worked out once, before any one input is signed
+        pubkeys = [master_key.get_pubkey_from_path(utxo.path.to_list()) for utxo in utxos]
+        spent = [(_outpoint_of(utxo), utxo.amount_in_sat,
+                  utxo.script_type.build_output_script(pubkey), SEQUENCE)
+                 for utxo, pubkey in zip(utxos, pubkeys)]
+
         for index in range(len(utxos)):
             utxo = utxos[index]
+            pubkey = pubkeys[index]
+
+            privkey = master_key.get_privkey_from_path(utxo.path.to_list())
+
+            if utxo.script_type == scripts.ScriptType.TAPROOT:
+                # Taproot signs a single sha256 under a tag, with Schnorr, over the key the
+                # output really pays rather than the one the path derived
+                hash = _taproot_sighash(index, spent, self.outputs)
+                tweaked = coincurve.PrivateKey(_taproot_privkey(privkey, pubkey))
+
+                # Nothing is appended: SIGHASH_DEFAULT is the hash type a 64 byte signature means
+                signature = tweaked.sign_schnorr(hash)
+
+                self.inputs.append((
+                    utxo,
+                    utxo.script_type.build_input_script(pubkey, signature),
+                    utxo.script_type.build_witness(pubkey, signature)
+                ))
+                continue
 
             # Build the inputs for signing: they should all have empty scripts, save for the input that we are signing,
             # which should have the output script of a P2PKH output.
-            pubkey = master_key.get_pubkey_from_path(utxo.path.to_list())
             script = scripts.ScriptType.LEGACY.build_output_script(pubkey)
             inputs = [(u, script if u == utxo else b'', []) for u in utxos]
 
@@ -58,7 +93,6 @@ class Transaction:
             tx.extend(SIGHASH_ALL.to_bytes(4, 'little'))
             hash = scripts.sha256(scripts.sha256(bytes(tx)))
 
-            privkey = master_key.get_privkey_from_path(utxo.path.to_list())
             signature = coincurve.PrivateKey(privkey).sign(hash, hasher=None)
 
             extended_signature = bytearray(signature)
@@ -245,6 +279,71 @@ def _serialize_tx(
 
     tx.extend(LOCKTIME.to_bytes(4, 'little'))
     return tx
+
+
+def _outpoint_of(utxo: scanner.Utxo) -> bytes:
+    """
+    Write an unspent output's outpoint the way a transaction carries it.
+    """
+    return _reversed(bytes.fromhex(utxo.txid)) + utxo.output_index.to_bytes(4, 'little')
+
+
+def _taproot_sighash(
+        input_index: int,
+        spent: List[Tuple[bytes, int, bytes, int]],
+        outputs: List[Tuple[int, bytes]]
+) -> bytes:
+    """
+    Compute the BIP341 digest signed for a taproot input spent by its key.
+
+    Each entry of spent is the outpoint, the amount and the script of the output being spent,
+    and the sequence the input carries.
+    """
+    # Where BIP143 committed to the one amount being spent, this commits to every input's
+    # amount and to the script each one pays, so a signature cannot be replayed against a
+    # transaction that lies to the signer about what the other inputs are worth
+    message = bytearray()
+
+    message.append(TAPROOT_EPOCH)
+    message.append(SIGHASH_DEFAULT)
+    message.extend(VERSION.to_bytes(4, 'little'))
+    message.extend(LOCKTIME.to_bytes(4, 'little'))
+
+    message.extend(scripts.sha256(b''.join(outpoint for outpoint, _, _, _ in spent)))
+    message.extend(scripts.sha256(b''.join(amount.to_bytes(8, 'little') for _, amount, _, _ in spent)))
+    message.extend(scripts.sha256(b''.join(_varint(len(paid)) + paid for _, _, paid, _ in spent)))
+    message.extend(scripts.sha256(b''.join(sequence.to_bytes(4, 'little') for _, _, _, sequence in spent)))
+
+    outs = bytearray()
+    for amount, script in outputs:
+        outs.extend(amount.to_bytes(8, 'little'))
+        outs.extend(_varint(len(script)))
+        outs.extend(script)
+
+    message.extend(scripts.sha256(bytes(outs)))
+    message.append(TAPROOT_KEY_PATH_SPEND_TYPE)
+    message.extend(input_index.to_bytes(4, 'little'))
+
+    return scripts.tagged_hash(TAPSIGHASH_TAG, bytes(message))
+
+
+def _taproot_privkey(privkey: bytes, pubkey: bytes) -> bytes:
+    """
+    Move a derived private key onto the output key that BIP86 pays, which is what spends it.
+    """
+    # The tweak is defined on the even point, so a derived key whose point has an odd y is
+    # negated before it is added to. The parity of what comes out is not this function's to
+    # settle: BIP340 signing takes whichever of the two it needs, and either one handed to
+    # it yields the same signature
+    scalar = int.from_bytes(privkey, 'big')
+
+    if pubkey[0] == ODD_Y_PREFIX:
+        scalar = CURVE_ORDER - scalar
+
+    tweak = scripts.tagged_hash(scripts.TAPTWEAK_TAG, pubkey[scripts.X_ONLY_STARTS_AT:])
+    tweaked = (scalar + int.from_bytes(tweak, 'big')) % CURVE_ORDER
+
+    return tweaked.to_bytes(SCALAR_LENGTH_IN_BYTES, 'big')
 
 
 def _serialize_tx_for_segwit_signing(

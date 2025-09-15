@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import unittest
 
+from bip32 import BIP32, HARDENED_INDEX
+from mnemonic import Mnemonic
+
 import scripts
 from scripts import ScriptType
 
@@ -28,6 +31,26 @@ BIP173_P2WSH_SCRIPT = bytes.fromhex('00201863143c14c5166804bd19203356da136c98567
 # The BIP350 vector that a wallet would really hand out today: a version 1, 32 byte program
 BIP350_V1_ADDRESS = 'bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0'
 
+
+# The BIP86 test vectors: the key BIP32 derives, the key the output really pays, and the
+# address that key is written as. The first two are the whole of what taproot adds here
+BIP86_VECTORS = [
+    ('cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115',
+     'a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c',
+     'bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr'),
+    ('83dfe85a3151d2517290da461fe2815591ef69f2b18a2ce63f01697a8b313145',
+     'a82f29944d65b86ae6b5e5cc75e294ead6c59391a1edc5e016e3498c67fc7bbb',
+     'bc1p4qhjn9zdvkux4e44uhx8tc55attvtyu358kutcqkudyccelu0was9fqzwh'),
+    ('399f1b2f4393f29a18c937859c5dd8a77350103157eb880f02e8c08214277cef',
+     '882d74e5d0572d5a816cef0041a96b6c1de832f6f9676d9605c44d5e9a97d3dc',
+     'bc1p3qkhfews2uk44qtvauqyr2ttdsw7svhkl9nkm9s9c3x4ax5h60wqwruhk7'),
+]
+
+# The BIP86 mnemonic and the account the vectors above hang under
+BIP86_MNEMONIC = ('abandon abandon abandon abandon abandon abandon abandon abandon abandon '
+                  'abandon abandon about')
+BIP86_PATHS = [[0, 0], [0, 1], [1, 0]]
+BIP86_PURPOSE = 86
 
 # Mainnet addresses and their output scripts from the BIP350 test vectors
 BIP350_VALID_ADDRESSES = [
@@ -105,6 +128,71 @@ class TestOutputScripts(unittest.TestCase):
         self.assertEqual(len(ScriptType.SEGWIT.build_output_script(BIP143_P2WPKH_PUBKEY)), 22)
 
 
+class TestTaprootOutputKey(unittest.TestCase):
+    """
+    The key a taproot output pays, which is not the key the path derives.
+    """
+
+    def test_the_bip86_path_derives_the_internal_key_of_each_vector(self) -> None:
+        # The other tests here start from the published internal key, which leaves the path
+        # that reaches it untested. These are the paths the catalogue looks under, and a
+        # wrong one finds nothing while every vector below still passes
+        root = BIP32.from_seed(Mnemonic.to_seed(BIP86_MNEMONIC))
+
+        # Zipping is what pairs them, and a zip over lists of different lengths walks the
+        # shorter one and says nothing, so 'each' has to be worth something first
+        self.assertEqual(len(BIP86_VECTORS), len(BIP86_PATHS))
+
+        for (internal, _, _), (chain, index) in zip(BIP86_VECTORS, BIP86_PATHS):
+            with self.subTest(chain=chain, index=index):
+                path = [BIP86_PURPOSE + HARDENED_INDEX, HARDENED_INDEX, HARDENED_INDEX, chain, index]
+
+                self.assertEqual(root.get_pubkey_from_path(path)[scripts.X_ONLY_STARTS_AT:].hex(), internal)
+
+    def test_the_output_key_is_the_derived_one_tweaked(self) -> None:
+        # BIP86 spends by the key alone, so there is no script tree and the tweak commits to
+        # the internal key and nothing else. An output paying the internal key is spendable
+        # by whoever holds its scalar, but it is not the one BIP86 names, so no wallet built
+        # on that standard would ever find it
+        for internal, output, _ in BIP86_VECTORS:
+            with self.subTest(key=internal[:8]):
+                self.assertEqual(scripts.taproot_output_key(bytes.fromhex(internal)).hex(), output)
+
+    def test_the_tweak_is_a_tagged_hash_of_the_internal_key(self) -> None:
+        # The tag is hashed and prepended twice, which is what keeps a hash meant for one
+        # purpose from being read as one meant for another
+        for internal, _, _ in BIP86_VECTORS:
+            with self.subTest(key=internal[:8]):
+                tag = scripts.sha256(b'TapTweak')
+                expected = scripts.sha256(tag + tag + bytes.fromhex(internal))
+                self.assertEqual(scripts.tagged_hash('TapTweak', bytes.fromhex(internal)), expected)
+
+    def test_taproot_builds_the_script_the_address_pays(self) -> None:
+        # Read back through the address, which is where these vectors can be checked against
+        # something this program did not compute
+        for internal, _, address in BIP86_VECTORS:
+            with self.subTest(address=address[:12]):
+                pubkey = bytes([2]) + bytes.fromhex(internal)
+                self.assertEqual(ScriptType.TAPROOT.build_output_script(pubkey),
+                                 scripts.build_output_script_from_address(address))
+
+    def test_the_prefix_byte_of_the_derived_key_does_not_reach_the_output(self) -> None:
+        # BIP340 keys are x only: the two compressed spellings of one point are one taproot
+        # output, and taking the 33 bytes as they come would make them two
+        for internal, _, _ in BIP86_VECTORS:
+            with self.subTest(key=internal[:8]):
+                even = ScriptType.TAPROOT.build_output_script(bytes([2]) + bytes.fromhex(internal))
+                odd = ScriptType.TAPROOT.build_output_script(bytes([3]) + bytes.fromhex(internal))
+                self.assertEqual(even, odd)
+
+    def test_the_script_is_a_witness_version_1_push_of_32_bytes(self) -> None:
+        script = ScriptType.TAPROOT.build_output_script(bytes([2]) + bytes.fromhex(BIP86_VECTORS[0][0]))
+
+        self.assertEqual(len(script), 34)
+        self.assertEqual(script[0], scripts.OP_1)
+        self.assertEqual(script[1], 32)
+
+
 class TestInputScriptsAndWitnesses(unittest.TestCase):
     """
     Input scripts and witnesses built from a public key and a signature.
@@ -129,6 +217,16 @@ class TestInputScriptsAndWitnesses(unittest.TestCase):
 
     def test_legacy_has_an_empty_witness(self) -> None:
         self.assertEqual(ScriptType.LEGACY.build_witness(BIP143_P2WPKH_PUBKEY, self.SIGNATURE), [])
+
+    def test_taproot_has_an_empty_input_script(self) -> None:
+        self.assertEqual(ScriptType.TAPROOT.build_input_script(BIP143_P2WPKH_PUBKEY, self.SIGNATURE), b'')
+
+    def test_a_taproot_witness_is_the_signature_and_nothing_else(self) -> None:
+        # The output already names the key, so repeating it would only be a byte a fee is
+        # paid on, and a second item is what tells the node to look for a script path
+        witness = ScriptType.TAPROOT.build_witness(BIP143_P2WPKH_PUBKEY, self.SIGNATURE)
+
+        self.assertEqual(witness, [self.SIGNATURE])
 
     def test_segwit_and_compat_witnesses_hold_the_signature_and_the_pubkey(self) -> None:
         for script_type in [ScriptType.COMPAT, ScriptType.SEGWIT]:

@@ -18,8 +18,8 @@ You can use Indy to sweep all the funds to a destination address of your choice.
 * Supports Electrum seed phrases, standard and segwit, which are not BIP39 and derive a
   different wallet from the same words
 * Supports the derivation paths and address types of most single key wallets listed in
-  [walletsrecovery.org](https://walletsrecovery.org/), taproot (BIP86) aside. Multisig (BIP48)
-  is not searched for at all
+  [walletsrecovery.org](https://walletsrecovery.org/), taproot (BIP86) among them, and sweeps
+  a taproot output by its key path. Multisig (BIP48) is not searched for at all
 * Supports customizing the address gap limit and the account gap limit
 * Supports using a custom electrum server
 
