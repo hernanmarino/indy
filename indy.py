@@ -800,7 +800,8 @@ async def find_utxos(
     print('⏳  Connecting to electrum server, this might take a while')
 
     client = StratumClient(my_proto_version=ELECTRUM_PROTOCOL_VERSIONS)
-    await client.connect(server, disable_cert_verify=insecure)
+    await scanner.only_so_long(client.connect(server, disable_cert_verify=insecure),
+                               'finish connecting')
 
     print('🌍  Connected to electrum server successfully')
 
@@ -860,7 +861,8 @@ async def find_utxos(
         return
 
     if fee_rate is None:
-        quoted_btc_per_kb = await client.RPC('blockchain.estimatefee', 1)
+        quoted_btc_per_kb = await scanner.only_so_long(
+            client.RPC('blockchain.estimatefee', 1), 'answer')
 
         if quoted_btc_per_kb == -1:
             print('🔁  Couldn\'t fetch fee rates, try again with manual fee rates using `--fee-rate`')
@@ -920,10 +922,18 @@ async def find_utxos(
 
     try:
         print('📣  Broadcasting transaction to the network')
-        txid = await client.RPC('blockchain.transaction.broadcast', bin_tx.hex())
+        txid = await scanner.only_so_long(
+            client.RPC('blockchain.transaction.broadcast', bin_tx.hex()), 'answer')
         print(f'✅  Transaction {txid} successfully broadcasted')
     except connectrum.exc.ElectrumErrorResponse as err:
         print(f'⛔️  Transaction broadcasting failed: {err}')
+    except scanner.ServerTookTooLong as err:
+        # The transaction was handed to the server before the wait began, so silence is not
+        # a refusal. Calling it a failure is what sends somebody off to spend those same
+        # outputs a second time, which is the one thing that can still lose the money here
+        print(f'🤷  {err}, so whether the transaction reached the network is not known')
+        print('    Broadcasting the hex above again costs nothing: it is that same '
+              'transaction, and the network takes it once')
 
     client.close()
 
