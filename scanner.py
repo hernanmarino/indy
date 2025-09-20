@@ -174,12 +174,13 @@ async def which_children_were_used(
         client: StratumClient,
         children: List[Tuple[str, BIP32]],
         should_batch: bool
-) -> List[Tuple[str, Script]]:
+) -> List[Tuple[str, List[Script]]]:
     """
-    Ask which of these wallets a server has ever seen, and where.
+    Ask which of these wallets a server has ever seen, and at which of their addresses.
 
-    Hands back the first script it has a history for in each one, which is what names the
-    wallet to whoever reads it: the path it hangs from and the address it pays.
+    Hands back every script it has a history for in each one. Keeping only the first would
+    name the wallet by one address and then answer what is left in it from that address
+    alone, which for a wallet used at one path and holding at another reads as empty.
     """
     # The scripts of every child go out together rather than one wallet at a time. A child
     # is forty seven scripts and a batch holds a hundred, so asking per child would spend a
@@ -198,8 +199,8 @@ async def which_children_were_used(
             if not isinstance(response, list):
                 raise ValueError(f'The server answered with {response!r} where a history belongs')
 
-            if response and form not in found:
-                found[form] = script
+            if response:
+                found.setdefault(form, []).append(script)
 
     return [(form, found[form]) for form, _ in children if form in found]
 
@@ -223,6 +224,38 @@ def probe_scripts(master_key: BIP32) -> List[Script]:
             return scripts
 
         scripts.append(script)
+
+
+async def balances_at(client: StratumClient, scripts_to_ask: List[List[Script]]) -> List[int]:
+    """
+    Say what is still sitting at each of a handful of addresses, one answer apiece.
+    """
+    # A history says a wallet was used and says nothing about what is left in it, which is
+    # what somebody decides on. One answer per address, because one total across several
+    # wallets would put another wallet's money under the name of this one
+    if not scripts_to_ask:
+        return []
+
+    asked = [(at, script) for at, group in enumerate(scripts_to_ask) for script in group]
+    request = [('blockchain.scripthash.listunspent', _electrum_script_hash(script.program))
+               for _, script in asked]
+    found = [0] * len(scripts_to_ask)
+
+    for (at, _), response in zip(asked, await _electrum_rpc(client, request)):
+        if not isinstance(response, list):
+            raise ValueError(f'The server answered with {response!r} where a list of outputs belongs')
+
+        total = 0
+
+        for entry in response:
+            if not isinstance(entry, dict) or 'value' not in entry:
+                raise ValueError(f'The server answered with {entry!r} where an output belongs')
+
+            total += _whole_number(entry['value'], 'an amount')
+
+        found[at] += total
+
+    return found
 
 
 def _check_against_its_transaction(utxo: Utxo, program: bytes, raw: object) -> None:

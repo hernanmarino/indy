@@ -22,6 +22,9 @@ ENGLISH = 0
 # How many bytes of the entropy each word count is spelled out of
 WORD_COUNTS = {12: 16, 18: 24, 24: 32}
 
+# What each form is asked for and reported under, and what a word form means
+WORD_FORM_NAMES = {f'{words}w': words for words in WORD_COUNTS}
+
 # Where the chain code ends and the private key begins in an xprv child, which is the other
 # way round from how BIP32 lays a key out
 CHAINCODE_LENGTH_IN_BYTES = 32
@@ -117,8 +120,8 @@ def children(root: BIP32, index: int) -> List[Tuple[str, BIP32]]:
     """
     placed = []
 
-    for words in WORD_COUNTS:
-        placed.append((f'{words}w', child_root(root, words, index)))
+    for form, words in WORD_FORM_NAMES.items():
+        placed.append((form, child_root(root, words, index)))
 
     # These two are the ones a key can come out of unusable, and only they are passed over:
     # the word children above are cut from entropy of their own

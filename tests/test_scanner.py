@@ -358,7 +358,7 @@ class TestWhichChildrenWereUsed(unittest.TestCase):
         found, _ = self._ask(children, {scanner._electrum_script_hash(script.program)})
 
         self.assertEqual([name for name, _ in found], [form])
-        self.assertEqual(found[0][1].program, script.program)
+        self.assertEqual([hit.program for hit in found[0][1]], [script.program])
 
     def test_a_hit_on_a_batch_boundary_belongs_to_the_child_that_owns_it(self) -> None:
         # Forty seven scripts a child and a hundred a batch means no child lines up with a
@@ -380,7 +380,7 @@ class TestWhichChildrenWereUsed(unittest.TestCase):
                 found, _ = self._ask(children, {scanner._electrum_script_hash(script.program)})
 
                 self.assertEqual([name for name, _ in found], [form])
-                self.assertEqual(found[0][1].program, script.program)
+                self.assertEqual([hit.program for hit in found[0][1]], [script.program])
 
     def test_the_children_of_several_indexes_go_out_together(self) -> None:
         # One round trip a child would spend four where one and a bit are needed
@@ -403,7 +403,7 @@ class TestWhichChildrenWereUsed(unittest.TestCase):
 
         self.assertEqual(client.calls, scripts)
 
-    def test_each_wallet_is_reported_once_however_many_of_its_scripts_were_used(self) -> None:
+    def test_a_wallet_is_reported_once_however_many_of_its_scripts_were_used(self) -> None:
         children = _children_of(2)
         form, root = children[0]
         used = {scanner._electrum_script_hash(script.program)
@@ -412,15 +412,18 @@ class TestWhichChildrenWereUsed(unittest.TestCase):
 
         self.assertEqual([name for name, _ in found], [form])
 
-    def test_the_script_reported_is_the_first_one_with_a_history(self) -> None:
-        # It is what names the wallet on screen, so which of several it is cannot drift
+    def test_every_script_with_a_history_comes_back_and_not_just_the_first(self) -> None:
+        # Keeping the first alone would name the wallet by one address and then answer what
+        # is left in it from that address, which for a wallet used at one path and holding
+        # at another says it is empty
         children = _children_of(1)
-        form, root = children[0]
-        scripts = scanner.probe_scripts(root)
-        used = {scanner._electrum_script_hash(script.program) for script in scripts[3:9]}
+        scripts = scanner.probe_scripts(children[0][1])
+        wanted = [scripts[3], scripts[8], scripts[40]]
+        used = {scanner._electrum_script_hash(script.program) for script in wanted}
         found, _ = self._ask(children, used)
 
-        self.assertEqual(found[0][1].program, scripts[3].program)
+        self.assertEqual([hit.program for hit in found[0][1]],
+                         [script.program for script in wanted])
 
     def test_the_order_reported_is_the_order_the_children_came_in(self) -> None:
         children = _children_of(3)
@@ -429,6 +432,69 @@ class TestWhichChildrenWereUsed(unittest.TestCase):
         found, _ = self._ask(children, used)
 
         self.assertEqual([name for name, _ in found], [form for form, _ in children])
+
+
+class TestBalancesAt(unittest.TestCase):
+    """
+    What is still sitting at the addresses a probe found, wallet by wallet.
+    """
+
+    class Answering(FakeClient):
+        """
+        Server that answers each scripthash with whatever it was told to.
+        """
+
+        def __init__(self, by_hash: Dict[str, object]) -> None:
+            super().__init__(set())
+            self.by_hash = by_hash
+
+        def _answer(self, method: str, script_hash: str) -> object:
+            return self.by_hash.get(script_hash, [])
+
+    def _ask(self, groups: List[List[object]], by_hash: Dict[str, object]) -> List[int]:
+        async def ask() -> object:
+            return await scanner.balances_at(self.Answering(by_hash), groups)
+
+        return asyncio.run(ask())
+
+    def _scripts(self) -> List[object]:
+        return scanner.probe_scripts(BIP32.from_seed(BIP32_TEST_SEED))[:4]
+
+    def test_nothing_asked_about_is_nothing_answered(self) -> None:
+        self.assertEqual(self._ask([], {}), [])
+
+    def test_each_wallet_gets_its_own_sum_and_not_the_whole(self) -> None:
+        # One number for all of them would put one wallet's money under another's name,
+        # and the one reported as empty is the one somebody stops looking for
+        first, second, third, fourth = self._scripts()
+        answers = {scanner._electrum_script_hash(script.program): [_unspent_worth(amount)]
+                   for script, amount in [(first, 1000), (second, 2000), (fourth, 7000)]}
+
+        self.assertEqual(self._ask([[first, second], [third], [fourth]], answers),
+                         [3000, 0, 7000])
+
+    def test_several_addresses_of_one_wallet_are_added_up(self) -> None:
+        first, second = self._scripts()[:2]
+        answers = {scanner._electrum_script_hash(script.program):
+                   [_unspent_worth(500), _unspent_worth(250)] for script in [first, second]}
+
+        self.assertEqual(self._ask([[first, second]], answers), [1500])
+
+    def test_an_output_the_server_made_up_is_refused_rather_than_counted_as_nothing(self) -> None:
+        # Zero reads as 'nothing is left in it', which is the sentence that ends a search,
+        # so a server that answers something else cannot be allowed to produce one
+        script = self._scripts()[0]
+        asked = scanner._electrum_script_hash(script.program)
+
+        for answer in [['not an output'], [{'no': 'value'}], [{'value': 'lots'}],
+                       [{'value': True}], 'not even a list']:
+            with self.subTest(answer=answer):
+                with self.assertRaises(ValueError):
+                    self._ask([[script]], {asked: answer})
+
+
+def _unspent_worth(amount: int) -> Dict[str, object]:
+    return {'tx_hash': 'ab' * 32, 'tx_pos': 0, 'value': amount}
 
 
 class TestRepeatedOutputs(unittest.TestCase):

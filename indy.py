@@ -20,10 +20,11 @@ from connectrum.client import StratumClient
 from connectrum.svr_info import ServerInfo
 from mnemonic import Mnemonic
 
+import bip85
 import scanner
 import scripts
 import transactions
-from descriptors import ACCOUNT_DEPTH, ROOT_DEPTH
+from descriptors import ACCOUNT_DEPTH, ROOT_DEPTH, Script
 
 # Offered to the server as a range, since not every server speaks the newest protocol
 ELECTRUM_PROTOCOL_VERSIONS = ['1.4', '1.4.2']
@@ -111,6 +112,9 @@ def main():
                         help='derive from a mnemonic whose BIP39 checksum does not match')
     parser.add_argument('--electrum', default=False, action='store_true',
                         help='read the phrase as Electrum\'s when it reads as BIP39 as well')
+    parser.add_argument('--show-bip85-phrase', default=False, action='store_true',
+                        help='print what opens each BIP85 wallet found, which is also what '
+                             'empties it and what stays in your scrollback')
     parser.add_argument('--show-multisig-keys', default=False, action='store_true',
                         help='print the multisig keys a private root holds, under BIP48 or '
                              'under Electrum\'s own convention, which reveal the addresses of '
@@ -133,6 +137,10 @@ def main():
 
     scanning.add_argument('--address-gap', metavar='<num>', default=20, type=int,
                           help='max empty addresses gap to explore (default: 20)')
+    scanning.add_argument('--bip85-indices', metavar='<num>', default=None, type=int,
+                          help='how many BIP85 child wallets of this seed to look under. '
+                               'Left off, three are looked under when nothing else turns '
+                               'up, and none when it does; 0 looks under none at all')
     scanning.add_argument('--account-gap', metavar='<num>', default=0, type=int,
                           help='max empty account levels gap to explore (default: 0)')
 
@@ -161,10 +169,20 @@ def main():
     key = _read_key(args.key)
     passphrase = _read_passphrase(args.passphrase, args.ask_passphrase)
 
+    if args.bip85_indices is not None and args.bip85_indices < 0:
+        parser.error('--bip85-indices counts wallets to look under, so it cannot be negative')
+
     # The version travels with the key rather than being worked out again here: the version
     # is an HMAC of the text, which any string has, and about one in two hundred and fifty
     # six lands on a prefix by chance. Only the parsing knows the input was read as a phrase
     master_key, electrum_version = parse_key(key, passphrase, args.allow_invalid_checksum, args.electrum)
+
+    # Asked for by name, so it is said now rather than after a scan that could not have
+    # looked. Left off, this is never reached: the search simply does not happen
+    if args.bip85_indices and not _bip85_can_be_looked_under(master_key):
+        parser.error('BIP85 hangs off a private root: every level of its path is hardened, '
+                     'and the path is counted from the root, so neither a public key nor '
+                     'the key of an account can reach it')
 
     if args.host is not None:
         port = (args.protocol + str(args.port)) if args.port else args.protocol
@@ -186,7 +204,9 @@ def main():
         args.yes,
         args.insecure,
         args.show_multisig_keys,
-        electrum_version
+        electrum_version,
+        args.bip85_indices,
+        args.show_bip85_phrase
     ))
 
 
@@ -630,6 +650,125 @@ def _report_multisig_keys(master_key: BIP32, should_show_keys: bool,
         print(f'    {spelled}  {script_type:{SCRIPT_TYPE_COLUMN}}  {written}')
 
 
+# How many wallets a seed is looked under when nobody said, which happens only once a scan
+# of the seed itself has come up empty
+BIP85_INDICES_WHEN_NOBODY_SAID = 3
+
+
+def _bip85_can_be_looked_under(master_key: BIP32) -> bool:
+    """
+    Whether BIP85 is even reachable from this key, which takes a private root.
+    """
+    # Every level of a BIP85 path is hardened, so a public key derives none of them. And the
+    # path is counted from the root: an account key is private and still cannot walk it
+    return master_key.privkey is not None and master_key.depth == ROOT_DEPTH
+
+
+def _report_no_bip85_was_looked_under(master_key: BIP32) -> None:
+    """
+    Say that another wallet may hide under this seed and that nothing looked for it.
+    """
+    print()
+    print('🌱  A seed can be the parent of other seeds under BIP85, and those are wallets of')
+
+    if not _bip85_can_be_looked_under(master_key):
+        print('    their own. Looking under them takes the seed phrase or the root xpriv, since')
+        print('    every level of that path is hardened and counted from the root')
+        return
+
+    print('    their own, with their own funds. Pass `--bip85-indices` to look under them')
+
+
+def _report_a_child_that_was_used(index: int, form: str, found: List[Script], balance: int) -> None:
+    """
+    Name a wallet hiding under this seed, without handing over what spends it.
+    """
+    # The path and the address are what make it recognisable, and neither of them spends
+    # anything. The phrase does, so it is kept back until somebody asks for it by name
+    print(f'🌱  Index {index}, {form}: a wallet under this seed that has been used')
+    print(f'    {found[0].full_path().path}  {scripts.address_of(found[0].program)}')
+
+    # The sum below is over every address that had a history, and the one printed above is
+    # the first of them. Writing an amount under a single address that may hold none of it
+    # would say the money is somewhere it is not
+    if len(found) > 1:
+        print(f'    and at {len(found) - 1} more of the addresses looked at')
+
+    # What was asked about is a handful of addresses, not the wallet, so this is a floor
+    # and never a total. Calling it the balance would say a wallet is empty when the money
+    # is at a path this did not look at, which is the sentence that ends a search
+    if balance:
+        print(f'    At least {balance} sats at the addresses looked at')
+    else:
+        print('    Nothing at the addresses looked at, which is not the same as nothing in it')
+
+
+def _report_what_a_bip85_search_covered(indices: int) -> None:
+    """
+    Say what was looked under, since a search that says nothing about its own reach reads
+    as though it had looked everywhere.
+    """
+    print(f'    Looked under {indices} {"index" if indices == 1 else "indices"}, 0 to '
+          f'{indices - 1}, in English, at twelve, eighteen and twenty four words, plus the')
+    print('    extended key and the seed Bitcoin Core takes. Not other languages, not other')
+    print('    word counts, and not a passphrase on the child. Of each of those wallets only')
+    print('    the first address of every path was asked about, so one used further along is')
+    print('    not ruled out, and neither is an index past the ones looked under')
+
+
+def _hand_over_what_spends_a_child(master_key: BIP32, index: int, form: str,
+                                   root: BIP32) -> None:
+    """
+    Print what opens one of those wallets, which was asked for by name.
+    """
+    print('    ⚠️   What follows spends those funds, and stays in your scrollback and in')
+    print('        whatever keeps a log of this terminal')
+
+    if form in bip85.WORD_FORM_NAMES:
+        print(f'        {bip85.mnemonic_child(master_key, bip85.WORD_FORM_NAMES[form], index)}')
+        return
+
+    if form == 'wif':
+        print(f'        {bip85.wif_child(master_key, index)}   (Bitcoin Core hdseed)')
+
+    print(f'        {root.get_xpriv()}')
+
+
+async def _look_under_bip85(client: StratumClient, master_key: BIP32, indices: int,
+                            should_batch: bool, show_phrase: bool) -> bool:
+    """
+    Look under the wallets this seed hides, and name the ones a server has ever seen.
+    """
+    children = [(index, form, root)
+                for index in range(indices)
+                for form, root in bip85.children(master_key, index)]
+
+    used = await scanner.which_children_were_used(
+        client, [(f'{index}:{form}', root) for index, form, root in children], should_batch)
+
+    if not used:
+        return False
+
+    balances = await scanner.balances_at(client, [found for _, found in used])
+    roots = {f'{index}:{form}': root for index, form, root in children}
+
+    for (name, found), balance in zip(used, balances):
+        index, form = name.split(':')
+        print()
+        _report_a_child_that_was_used(int(index), form, found, balance)
+
+        if show_phrase:
+            _hand_over_what_spends_a_child(master_key, int(index), form, roots[name])
+
+    print()
+
+    if not show_phrase:
+        print('    Each of those is a wallet of its own. Pass `--show-bip85-phrase` to be')
+        print('    handed what opens it, which is also what empties it')
+
+    return True
+
+
 async def find_utxos(
         server: ServerInfo,
         master_key: BIP32,
@@ -643,7 +782,9 @@ async def find_utxos(
         assume_yes: bool = False,
         insecure: bool = False,
         show_multisig_keys: bool = False,
-        electrum_version: Optional[str] = None
+        electrum_version: Optional[str] = None,
+        bip85_indices: Optional[int] = None,
+        show_bip85_phrase: bool = False
 ):
     """
     Connect to an electrum server and find every UTXO a key reaches, spendable or not.
@@ -665,14 +806,46 @@ async def find_utxos(
 
     utxos = await scanner.scan_master_key(client, master_key, address_gap, account_gap, should_batch)
 
+    # How far to look under this seed, when nobody said. A scan that found nothing is the
+    # moment to look; one that found something is not worth the wait unless it was asked for
+    asked_for_bip85 = bip85_indices is not None
+    looking_under = bip85_indices if asked_for_bip85 else (
+        BIP85_INDICES_WHEN_NOBODY_SAID if len(utxos) == 0 else 0)
+
+    if looking_under and not _bip85_can_be_looked_under(master_key):
+        looking_under = 0
+
+    named_a_child = False
+
+    # Before the sad face and before the sweep alike: with `--yes` nobody reads what comes
+    # after the transaction, and a sweep of the seed is not a sweep of what hides under it
+    if looking_under:
+        named_a_child = await _look_under_bip85(client, master_key, looking_under,
+                                                should_batch, show_bip85_phrase)
+
     if len(utxos) == 0:
-        print('😔  Didn\'t find any unspent outputs')
+        if not named_a_child:
+            print('😔  Didn\'t find any unspent outputs')
+
+        if looking_under:
+            _report_what_a_bip85_search_covered(looking_under)
+        else:
+            _report_no_bip85_was_looked_under(master_key)
+
         _report_multisig_keys(master_key, show_multisig_keys, electrum_version)
         client.close()
         return
 
+    # Everything BIP85 has to say goes before the first number about this key's own money,
+    # since with `--yes` the hex and the broadcast follow that number without a pause
+    if looking_under:
+        _report_what_a_bip85_search_covered(looking_under)
+    else:
+        _report_no_bip85_was_looked_under(master_key)
+
     balance = sum([utxo.amount_in_sat for utxo in utxos])
-    print(f'💸  Total spendable balance found: {balance} sats')
+    print()
+    print(f'💸  Total spendable balance found in the key that was read: {balance} sats')
 
     _report_multisig_keys(master_key, show_multisig_keys, electrum_version)
 
@@ -725,7 +898,7 @@ async def find_utxos(
     # so the rate it ends up paying is close to the one asked for rather than exactly it
     paid_rate = fee / tx.virtual_size()
 
-    print('👇  This transaction sweeps all funds to the address provided')
+    print('👇  This transaction sweeps all funds of the key that was read, to the address given')
     print()
     print(f'    To:    {address}')
     print(f'    Sends: {balance - fee} sats')
