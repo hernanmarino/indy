@@ -12,6 +12,11 @@ from scripts import ScriptType
 
 MAX_BATCH_SIZE = 100
 
+# What it takes to ask whether a wallet was ever used at all: the first index of the first
+# account of every descriptor, and nothing further
+FIRST_INDEX_ONLY = 0
+FIRST_ACCOUNT_ONLY = 0
+
 # Nothing a server says about an output is taken on faith: these are the shapes a real one has
 TXID_LENGTH_IN_BYTES = 32
 MAX_OUTPUT_INDEX = 0xffff_ffff
@@ -163,6 +168,61 @@ async def scan_master_key(
             progress_bar.refresh()
 
     return utxos
+
+
+async def which_children_were_used(
+        client: StratumClient,
+        children: List[Tuple[str, BIP32]],
+        should_batch: bool
+) -> List[Tuple[str, Script]]:
+    """
+    Ask which of these wallets a server has ever seen, and where.
+
+    Hands back the first script it has a history for in each one, which is what names the
+    wallet to whoever reads it: the path it hangs from and the address it pays.
+    """
+    # The scripts of every child go out together rather than one wallet at a time. A child
+    # is forty seven scripts and a batch holds a hundred, so asking per child would spend a
+    # round trip on each of them and leave half of every batch empty
+    asked = [(form, script) for form, root in children for script in probe_scripts(root)]
+    found = {}
+
+    window_size = MAX_BATCH_SIZE if should_batch else 1
+
+    for at in range(0, len(asked), window_size):
+        window = asked[at:at + window_size]
+        request = [('blockchain.scripthash.get_history', _electrum_script_hash(script.program))
+                   for _, script in window]
+
+        for (form, script), response in zip(window, await _electrum_rpc(client, request)):
+            if not isinstance(response, list):
+                raise ValueError(f'The server answered with {response!r} where a history belongs')
+
+            if response and form not in found:
+                found[form] = script
+
+    return [(form, found[form]) for form, _ in children if form in found]
+
+
+def probe_scripts(master_key: BIP32) -> List[Script]:
+    """
+    The scripts that say whether a wallet was ever used, which is the first of every
+    descriptor the catalogue knows.
+    """
+    # The whole catalogue at its first index, rather than a handful of paths picked by hand.
+    # What the catalogue is for is that a wallet can be anywhere in it: Bisq and KoinKeep on
+    # the second account of BIP44, an Electrum standard wallet right under the key, Bitcoin
+    # Core three hardened levels down. Sampling four of them would miss exactly those
+    iterator = ScriptIterator(master_key, FIRST_INDEX_ONLY, FIRST_ACCOUNT_ONLY)
+    scripts = []
+
+    while True:
+        script = iterator.next_script()
+
+        if not script:
+            return scripts
+
+        scripts.append(script)
 
 
 def _check_against_its_transaction(utxo: Utxo, program: bytes, raw: object) -> None:
