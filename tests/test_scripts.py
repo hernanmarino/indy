@@ -5,7 +5,7 @@ from bip32 import BIP32, HARDENED_INDEX
 from mnemonic import Mnemonic
 
 import scripts
-from scripts import ScriptType
+from scripts import OP_1, OP_CHECKSIG, OP_DUP, OP_EQUAL, OP_EQUALVERIFY, OP_HASH160, ScriptType
 
 # Public keys and their hashes from the BIP143 test vectors
 BIP143_P2WPKH_PUBKEY = bytes.fromhex('025476c2e83188368da1ff3e292e7acafcdb3566bb0ad253f62fc70f07aeee6357')
@@ -275,6 +275,74 @@ class TestOutputScriptFromAddress(unittest.TestCase):
 
     def test_rejects_an_unrecognized_string(self) -> None:
         self.assertIsNone(scripts.build_output_script_from_address('not an address'))
+
+
+class TestWritingAnAddress(unittest.TestCase):
+    """
+    Writing an output script back out as the address a wallet would have shown.
+    """
+
+    def test_writes_the_base58_addresses_of_the_bip143_vectors(self) -> None:
+        self.assertEqual(scripts.address_of(BIP143_P2PKH_SCRIPT), BIP143_P2PKH_ADDRESS)
+        self.assertEqual(scripts.address_of(BIP143_P2SH_SCRIPT), BIP143_P2SH_ADDRESS)
+
+    def test_writes_the_segwit_addresses_of_the_bip173_vectors(self) -> None:
+        self.assertEqual(scripts.address_of(BIP173_P2WPKH_SCRIPT), BIP173_P2WPKH_ADDRESS)
+        self.assertEqual(scripts.address_of(BIP173_P2WSH_SCRIPT), BIP173_P2WSH_ADDRESS)
+
+    def test_every_valid_bip350_vector_is_written_as_the_vector_spells_it(self) -> None:
+        # Those vectors are given in either case; an address is written in lower case
+        for address, program in BIP350_VALID_ADDRESSES:
+            with self.subTest(address=address[:16]):
+                self.assertEqual(scripts.address_of(bytes.fromhex(program)), address.lower())
+
+    def test_what_is_written_reads_back_as_the_script_it_came_from(self) -> None:
+        for _, program in BIP350_VALID_ADDRESSES:
+            with self.subTest(program=program[:12]):
+                script = bytes.fromhex(program)
+                self.assertEqual(scripts.build_output_script_from_address(scripts.address_of(script)),
+                                 script)
+
+    def test_a_script_that_pays_to_no_address_is_not_given_one(self) -> None:
+        # A bare multisig, an OP_RETURN and a truncated push are all valid scripts that no
+        # wallet ever displayed as an address, and inventing one for them would be a lie
+        for program in [b'\x6a\x04test', b'\x51', b'\x00\x14' + b'\x11' * 19,
+                        bytes([OP_1, 32]) + b'\x11' * 31,
+                        bytes([OP_DUP, OP_HASH160, 20]) + b'\x11' * 20]:
+            with self.subTest(program=program.hex()[:14]):
+                self.assertIsNone(scripts.address_of(program))
+
+    def test_a_witness_program_of_a_length_its_version_forbids_has_no_address(self) -> None:
+        # The push is consistent here, so this is turned down for the rule BIP141 puts on
+        # version nought and not for being malformed, which is what the cases above catch
+        self.assertIsNone(scripts.address_of(b'\x00\x15' + b'\x11' * 21))
+        self.assertIsNone(scripts.address_of(b'\x00\x02' + b'\x11' * 2))
+        self.assertIsNotNone(scripts.address_of(b'\x00\x14' + b'\x11' * 20))
+
+    def test_a_script_shaped_like_a_p2sh_that_does_not_end_like_one_has_no_address(self) -> None:
+        # Right length, right prefix, another ending. Reading the hash out of it would name
+        # a 3 address for a script that pays to something else entirely
+        self.assertIsNone(scripts.address_of(bytes([OP_HASH160, 20]) + b'\x11' * 20
+                                             + bytes([OP_EQUALVERIFY])))
+        self.assertIsNotNone(scripts.address_of(bytes([OP_HASH160, 20]) + b'\x11' * 20
+                                                + bytes([OP_EQUAL])))
+
+    def test_a_push_of_the_wrong_length_is_not_read_as_a_hash(self) -> None:
+        # The byte between the opcodes says how much is being pushed. A script whose total
+        # length is the legal one but whose push says something else does not put that hash
+        # on the stack, and naming it would name an address the script never pays
+        self.assertIsNone(scripts.address_of(bytes([OP_DUP, OP_HASH160, 21]) + b'\x11' * 20
+                                             + bytes([OP_EQUALVERIFY, OP_CHECKSIG])))
+        self.assertIsNone(scripts.address_of(bytes([OP_HASH160, 21]) + b'\x11' * 20
+                                             + bytes([OP_EQUAL])))
+
+    def test_a_script_shaped_like_a_p2pkh_that_does_not_end_like_one_has_no_address(self) -> None:
+        # Right length, right prefix, and it spends by some other rule. Reading the hash out
+        # of it would name an address that script does not pay
+        self.assertIsNone(scripts.address_of(bytes([OP_DUP, OP_HASH160, 20]) + b'\x11' * 20
+                                             + bytes([OP_EQUALVERIFY, OP_EQUAL])))
+        self.assertIsNotNone(scripts.address_of(bytes([OP_DUP, OP_HASH160, 20]) + b'\x11' * 20
+                                                + bytes([OP_EQUALVERIFY, OP_CHECKSIG])))
 
 
 class TestSegwitAddresses(unittest.TestCase):
