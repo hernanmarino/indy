@@ -945,5 +945,91 @@ class TestCheckingWhatWasFound(unittest.TestCase):
                 self._scan(spending=spending)
 
 
+class SilentClient:
+    """
+    Electrum server that takes a question and then never says anything back.
+    """
+
+    def __init__(self) -> None:
+        self.asked = 0
+
+    async def RPC(self, method: str, *params: Any) -> object:
+        return await self._say_nothing()
+
+    async def batch_rpc(self, requests: List[Tuple[str, ...]]) -> object:
+        return await self._say_nothing()
+
+    async def _say_nothing(self) -> object:
+        self.asked += 1
+
+        # Not a long wait but one that nothing ever ends, which is what a server that holds
+        # the connection open without answering looks like from this side
+        await asyncio.Event().wait()
+
+
+class TestAServerThatNeverAnswers(unittest.TestCase):
+    """
+    Giving up on a server that takes the question and leaves the scan waiting on it.
+    """
+
+    # Long enough that a real answer would be in by now, short enough that the suite does
+    # not sit through it
+    PATIENCE = 0.05
+
+    def _refusal_of(self, asking) -> str:
+        """
+        Run something that asks a silent server, and hand back how it refused to go on.
+        """
+        client = SilentClient()
+
+        with mock.patch.object(scanner, 'SERVER_PATIENCE_IN_SECONDS', self.PATIENCE):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                with self.assertRaises(ValueError) as refused:
+                    asyncio.run(asking(client))
+
+        # Asked once and given up on, rather than asked again: a server that answered
+        # nothing the first time is not more likely to answer the second
+        self.assertEqual(client.asked, 1)
+
+        return str(refused.exception)
+
+    def test_a_scan_gives_up_rather_than_waiting_forever(self) -> None:
+        master_key = BIP32.from_seed(BIP32_TEST_SEED)
+
+        self._refusal_of(lambda client: scanner.scan_master_key(client, master_key, 20, 0, True))
+
+    def test_a_scan_asking_one_address_at_a_time_gives_up_too(self) -> None:
+        # Batched or not, the question leaves through a different call on the client
+        master_key = BIP32.from_seed(BIP32_TEST_SEED)
+
+        self._refusal_of(lambda client: scanner.scan_master_key(client, master_key, 20, 0, False))
+
+    def test_asking_which_children_were_used_gives_up(self) -> None:
+        self._refusal_of(lambda client: scanner.which_children_were_used(client, _children_of(2), True))
+
+    def test_asking_what_is_left_at_an_address_gives_up(self) -> None:
+        found = scanner.probe_scripts(BIP32.from_seed(BIP32_TEST_SEED))[:2]
+
+        self._refusal_of(lambda client: scanner.balances_at(client, [found]))
+
+    def test_the_patience_it_ships_with_does_run_out(self) -> None:
+        # Every test here hands it a patience of its own and then says what happens when that
+        # one runs out. None of them would notice if the one the tool really uses never did,
+        # and an endless patience is a number like any other: it passes for one all the way
+        # down to the wait that is handed it, and there it quietly means forever again
+        self.assertIsInstance(scanner.SERVER_PATIENCE_IN_SECONDS, (int, float))
+        self.assertTrue(math.isfinite(scanner.SERVER_PATIENCE_IN_SECONDS))
+        self.assertGreater(scanner.SERVER_PATIENCE_IN_SECONDS, 0)
+
+    def test_it_says_it_was_the_server_and_how_long_it_waited(self) -> None:
+        # Which is the whole of what somebody can act on: the key is fine, the server is not,
+        # and running it again against another one is the way out
+        master_key = BIP32.from_seed(BIP32_TEST_SEED)
+        refusal = self._refusal_of(lambda client: scanner.scan_master_key(client, master_key, 20, 0, True))
+
+        self.assertIn('server', refusal)
+        self.assertIn(str(self.PATIENCE), refusal)
+
+
 if __name__ == '__main__':
     unittest.main()

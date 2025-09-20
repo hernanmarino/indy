@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-from typing import List, Tuple
+import asyncio
+from typing import Awaitable, List, Tuple
 
 from bip32 import BIP32
 from connectrum.client import StratumClient
@@ -11,6 +12,23 @@ from descriptors import Path, Script, ScriptIterator, written_under
 from scripts import ScriptType
 
 MAX_BATCH_SIZE = 100
+
+# How long a server is given to do what it was asked before the tool stops waiting on it.
+# Nothing in the protocol ever ends that wait: one that takes the request and then says
+# nothing holds the tool open for as long as it is left running, and from this side that
+# looks exactly like an answer still on its way. Counted per answer rather than per run,
+# so that a server which is merely slow is not cut off in the middle of a long scan
+SERVER_PATIENCE_IN_SECONDS = 60
+
+
+# Its own class, and still a ValueError, because of what it means where the wait ran out. To
+# a scan it is one more server that cannot be used, which is what every other ValueError here
+# says. To a broadcast it is the one answer that is not a refusal: the request was on the wire
+# before the wait began, so what became of it is not known either way
+class ServerTookTooLong(ValueError):
+    """
+    A server was given its while and did not answer within it.
+    """
 
 # What it takes to ask whether a wallet was ever used at all: the first index of the first
 # account of every descriptor, and nothing further
@@ -258,6 +276,17 @@ async def balances_at(client: StratumClient, scripts_to_ask: List[List[Script]])
     return found
 
 
+async def only_so_long(waiting_on: Awaitable, what: str) -> object:
+    """
+    Wait on a server for a while, rather than for good.
+    """
+    try:
+        return await asyncio.wait_for(waiting_on, SERVER_PATIENCE_IN_SECONDS)
+    except asyncio.TimeoutError:
+        raise ServerTookTooLong(
+            f'The server took more than {SERVER_PATIENCE_IN_SECONDS} seconds to {what}')
+
+
 def _check_against_its_transaction(utxo: Utxo, program: bytes, raw: object) -> None:
     """
     Check an output against the transaction that holds it, refusing anything that disagrees.
@@ -358,10 +387,10 @@ async def _electrum_rpc(client: StratumClient, requests: List[Tuple[str, ...]]) 
 
     if len(requests) == 1:
         request = requests[0]
-        response = await client.RPC(*request)
+        response = await only_so_long(client.RPC(*request), 'answer')
         return [response]
 
-    response = await client.batch_rpc(requests)
+    response = await only_so_long(client.batch_rpc(requests), 'answer')
 
     if not isinstance(response, list) or len(response) != len(requests):
         raise ValueError(f'The server answered {len(requests)} requests with {response!r}')

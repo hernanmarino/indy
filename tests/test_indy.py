@@ -2158,5 +2158,115 @@ class TestEventLoop(unittest.TestCase):
         self.assertIs(client.loop, running_loop)
 
 
+class StallingClient:
+    """
+    Electrum client that behaves until it is asked for one particular thing, and from there
+    holds the connection open and says nothing.
+    """
+
+    def __init__(self, stalls_at: str, screen: Optional[object] = None) -> None:
+        self.stalls_at = stalls_at
+        self.screen = screen
+        self.broadcast: List[object] = []
+        self.screen_when_handed_the_transaction = ''
+
+    async def connect(self, *args: object, **kwargs: object) -> None:
+        if self.stalls_at == 'connect':
+            await self._say_nothing()
+
+    async def batch_rpc(self, requests: List[Tuple[str, ...]]) -> object:
+        return [[] for _ in requests]
+
+    async def RPC(self, method: str, *params: object) -> object:
+        # Written down before the stalling, the way connectrum puts the request on the wire
+        # and only then hands back something to wait on
+        if method == 'blockchain.transaction.broadcast':
+            self.broadcast.append(params[0])
+            self.screen_when_handed_the_transaction = self.screen() if self.screen else ''
+
+        if method == self.stalls_at:
+            await self._say_nothing()
+
+        if method == 'blockchain.estimatefee':
+            return 0.0001
+
+        if method == 'blockchain.transaction.broadcast':
+            return 'cd' * 32
+
+        raise AssertionError(f'The sweep asked for an unknown method: {method}')
+
+    def close(self) -> None:
+        pass
+
+    async def _say_nothing(self) -> object:
+        await asyncio.Event().wait()
+
+
+class TestAServerThatNeverAnswers(unittest.TestCase):
+    """
+    Giving up on a server that goes quiet, at each of the moments a sweep waits on one.
+    """
+
+    PATIENCE = 0.05
+
+    def _sweep_against(self, stalls_at: str) -> Tuple[Optional[str], str, StallingClient]:
+        """
+        Run a whole sweep against a server that goes quiet at that moment, and hand back how
+        it gave up: what it refused with, if it refused at all, and what the user was told.
+        """
+        master_key = BIP32.from_seed(bytes.fromhex('000102030405060708090a0b0c0d0e0f'))
+        utxo = scanner.Utxo('ab' * 32, 0, 1_000_000, Path("m/84'/0'/0'/0/0"), ScriptType.SEGWIT)
+        output = io.StringIO()
+        client = StallingClient(stalls_at, output.getvalue)
+        refusal = None
+
+        async def scan(*args: object) -> List[scanner.Utxo]:
+            return [utxo]
+
+        with mock.patch.object(indy, 'StratumClient', lambda **kwargs: client), \
+             mock.patch.object(scanner, 'scan_master_key', scan), \
+             mock.patch.object(scanner, 'SERVER_PATIENCE_IN_SECONDS', self.PATIENCE):
+            with redirect_stdout(output), redirect_stderr(io.StringIO()):
+                try:
+                    asyncio.run(indy.find_utxos(TEST_SERVER, master_key, 20, 0, DESTINATION, None,
+                                                True, True, assume_yes=True))
+                except ValueError as err:
+                    refusal = str(err)
+
+        return refusal, output.getvalue(), client
+
+    def test_connecting_gives_up_rather_than_waiting_forever(self) -> None:
+        # The longest wait of all without this: a host that answers the handshake and then
+        # leaves it open holds the tool at 'this might take a while' for as long as it runs
+        refusal, _, _ = self._sweep_against('connect')
+
+        self.assertIn('server', refusal)
+        self.assertIn(str(self.PATIENCE), refusal)
+
+    def test_asking_for_a_fee_rate_gives_up(self) -> None:
+        refusal, _, _ = self._sweep_against('blockchain.estimatefee')
+
+        self.assertIn('server', refusal)
+        self.assertIn(str(self.PATIENCE), refusal)
+
+    def test_a_broadcast_nobody_answered_is_not_called_a_failure(self) -> None:
+        # The transaction was handed over before the wait began. Whoever is told it failed
+        # goes and spends those same outputs somewhere else, which is how the money is lost
+        refusal, output, client = self._sweep_against('blockchain.transaction.broadcast')
+
+        self.assertEqual(len(client.broadcast), 1)
+        self.assertIsNone(refusal)
+        self.assertNotIn('failed', output)
+        self.assertIn('not known', output)
+
+    def test_the_transaction_is_on_screen_before_it_is_handed_over(self) -> None:
+        # Which is the whole of what makes an unanswered broadcast recoverable, and it is
+        # the order that makes it so: read off the screen as it stood when the server was
+        # handed the transaction, not as it stood once everything was over
+        _, _, client = self._sweep_against('blockchain.transaction.broadcast')
+
+        self.assertIn(client.broadcast[0], client.screen_when_handed_the_transaction.splitlines())
+
+
 if __name__ == '__main__':
     unittest.main()
