@@ -17,6 +17,16 @@ OP_CHECKSIG = 0xac
 
 P2PKH_ADDRESS_HEADER = 0x00
 P2SH_ADDRESS_HEADER = 0x05
+P2PKH_SCRIPT_LENGTH_IN_BYTES = 25
+P2SH_SCRIPT_LENGTH_IN_BYTES = 23
+HASH_LENGTH_IN_BYTES = 20
+
+# Where the hash begins in each of them, which is past the opcodes that introduce it
+P2PKH_HASH_STARTS_AT = 3
+P2SH_HASH_STARTS_AT = 2
+
+# Where a witness program begins, past the version opcode and the byte that pushes it
+WITNESS_PROGRAM_STARTS_AT = 2
 BASE58_ADDRESS_LENGTH_IN_BYTES = 21
 BECH32_HRP = 'bc'
 BECH32_SEPARATOR = '1'
@@ -167,6 +177,77 @@ def build_output_script_from_address(address: str) -> Optional[bytes]:
         return _build_segwit_output_script(version, program)
 
     return None
+
+
+def address_of(program: bytes) -> Optional[str]:
+    """
+    Write an output script the way a wallet shows it, or nothing if it shows as no address.
+    """
+    # The inverse of reading one, and held to the same shapes: anything else is a script
+    # that pays to no address a wallet would ever have displayed
+    if _is_p2pkh(program):
+        return base58.b58encode_check(bytes([P2PKH_ADDRESS_HEADER])
+                                      + program[P2PKH_HASH_STARTS_AT:
+                                                P2PKH_HASH_STARTS_AT + HASH_LENGTH_IN_BYTES]).decode()
+
+    if _is_p2sh(program):
+        return base58.b58encode_check(bytes([P2SH_ADDRESS_HEADER])
+                                      + program[P2SH_HASH_STARTS_AT:
+                                                P2SH_HASH_STARTS_AT + HASH_LENGTH_IN_BYTES]).decode()
+
+    version = _witness_version_of(program)
+
+    if version is None:
+        return None
+
+    return _encode_segwit_address(version, program[WITNESS_PROGRAM_STARTS_AT:])
+
+
+def _is_p2pkh(program: bytes) -> bool:
+    return (len(program) == P2PKH_SCRIPT_LENGTH_IN_BYTES
+            and program[:3] == bytes([OP_DUP, OP_HASH160, HASH_LENGTH_IN_BYTES])
+            and program[-2:] == bytes([OP_EQUALVERIFY, OP_CHECKSIG]))
+
+
+def _is_p2sh(program: bytes) -> bool:
+    return (len(program) == P2SH_SCRIPT_LENGTH_IN_BYTES
+            and program[:2] == bytes([OP_HASH160, HASH_LENGTH_IN_BYTES])
+            and program[-1] == OP_EQUAL)
+
+
+def _witness_version_of(program: bytes) -> Optional[int]:
+    """
+    The witness version a script pays to, or nothing if it is no witness program at all.
+    """
+    if len(program) < WITNESS_PROGRAM_STARTS_AT or program[1] != len(program) - WITNESS_PROGRAM_STARTS_AT:
+        return None
+
+    if program[0] == OP_0:
+        version = 0
+    elif OP_1 <= program[0] <= OP_1 + MAX_WITNESS_VERSION - 1:
+        version = program[0] - OP_1 + 1
+    else:
+        return None
+
+    return version if _witness_program_length_is_valid(
+        version, len(program) - WITNESS_PROGRAM_STARTS_AT) else None
+
+
+def _encode_segwit_address(version: int, program: bytes) -> str:
+    """
+    Write a witness program as the address BIP173 and BIP350 spell it out as.
+    """
+    # Version nought keeps the checksum it was given out under, and every later one takes
+    # bech32m, so that an old wallet fails the checksum rather than paying the wrong thing
+    constant = BECH32_CHECKSUM if version == 0 else BECH32M_CHECKSUM
+    data = [version] + bech32.convertbits(program, 8, 5)
+    polymod = bech32.bech32_polymod(bech32.bech32_hrp_expand(BECH32_HRP) + data
+                                    + [0] * CHECKSUM_LENGTH_IN_CHARS) ^ constant
+    checksum = [(polymod >> 5 * (CHECKSUM_LENGTH_IN_CHARS - 1 - at)) & 31
+                for at in range(CHECKSUM_LENGTH_IN_CHARS)]
+
+    return BECH32_HRP + BECH32_SEPARATOR + ''.join(bech32.CHARSET[value]
+                                                   for value in data + checksum)
 
 
 def _decode_segwit_address(address: str) -> Optional[Tuple[int, bytes]]:

@@ -12,6 +12,11 @@ from scripts import ScriptType
 
 MAX_BATCH_SIZE = 100
 
+# What it takes to ask whether a wallet was ever used at all: the first index of the first
+# account of every descriptor, and nothing further
+FIRST_INDEX_ONLY = 0
+FIRST_ACCOUNT_ONLY = 0
+
 # Nothing a server says about an output is taken on faith: these are the shapes a real one has
 TXID_LENGTH_IN_BYTES = 32
 MAX_OUTPUT_INDEX = 0xffff_ffff
@@ -163,6 +168,94 @@ async def scan_master_key(
             progress_bar.refresh()
 
     return utxos
+
+
+async def which_children_were_used(
+        client: StratumClient,
+        children: List[Tuple[str, BIP32]],
+        should_batch: bool
+) -> List[Tuple[str, List[Script]]]:
+    """
+    Ask which of these wallets a server has ever seen, and at which of their addresses.
+
+    Hands back every script it has a history for in each one. Keeping only the first would
+    name the wallet by one address and then answer what is left in it from that address
+    alone, which for a wallet used at one path and holding at another reads as empty.
+    """
+    # The scripts of every child go out together rather than one wallet at a time. A child
+    # is forty seven scripts and a batch holds a hundred, so asking per child would spend a
+    # round trip on each of them and leave half of every batch empty
+    asked = [(form, script) for form, root in children for script in probe_scripts(root)]
+    found = {}
+
+    window_size = MAX_BATCH_SIZE if should_batch else 1
+
+    for at in range(0, len(asked), window_size):
+        window = asked[at:at + window_size]
+        request = [('blockchain.scripthash.get_history', _electrum_script_hash(script.program))
+                   for _, script in window]
+
+        for (form, script), response in zip(window, await _electrum_rpc(client, request)):
+            if not isinstance(response, list):
+                raise ValueError(f'The server answered with {response!r} where a history belongs')
+
+            if response:
+                found.setdefault(form, []).append(script)
+
+    return [(form, found[form]) for form, _ in children if form in found]
+
+
+def probe_scripts(master_key: BIP32) -> List[Script]:
+    """
+    The scripts that say whether a wallet was ever used, which is the first of every
+    descriptor the catalogue knows.
+    """
+    # The whole catalogue at its first index, rather than a handful of paths picked by hand.
+    # What the catalogue is for is that a wallet can be anywhere in it: Bisq and KoinKeep on
+    # the second account of BIP44, an Electrum standard wallet right under the key, Bitcoin
+    # Core three hardened levels down. Sampling four of them would miss exactly those
+    iterator = ScriptIterator(master_key, FIRST_INDEX_ONLY, FIRST_ACCOUNT_ONLY)
+    scripts = []
+
+    while True:
+        script = iterator.next_script()
+
+        if not script:
+            return scripts
+
+        scripts.append(script)
+
+
+async def balances_at(client: StratumClient, scripts_to_ask: List[List[Script]]) -> List[int]:
+    """
+    Say what is still sitting at each of a handful of addresses, one answer apiece.
+    """
+    # A history says a wallet was used and says nothing about what is left in it, which is
+    # what somebody decides on. One answer per address, because one total across several
+    # wallets would put another wallet's money under the name of this one
+    if not scripts_to_ask:
+        return []
+
+    asked = [(at, script) for at, group in enumerate(scripts_to_ask) for script in group]
+    request = [('blockchain.scripthash.listunspent', _electrum_script_hash(script.program))
+               for _, script in asked]
+    found = [0] * len(scripts_to_ask)
+
+    for (at, _), response in zip(asked, await _electrum_rpc(client, request)):
+        if not isinstance(response, list):
+            raise ValueError(f'The server answered with {response!r} where a list of outputs belongs')
+
+        total = 0
+
+        for entry in response:
+            if not isinstance(entry, dict) or 'value' not in entry:
+                raise ValueError(f'The server answered with {entry!r} where an output belongs')
+
+            total += _whole_number(entry['value'], 'an amount')
+
+        found[at] += total
+
+    return found
 
 
 def _check_against_its_transaction(utxo: Utxo, program: bytes, raw: object) -> None:

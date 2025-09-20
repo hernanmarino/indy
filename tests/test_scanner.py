@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import io
+import math
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Any, Dict, List, Set, Tuple
@@ -209,6 +210,291 @@ def _run_scan(without_a_terminal: bool) -> Tuple[List[scanner.Utxo], str]:
             utxos = asyncio.run(scan())
 
     return utxos, captured.getvalue()
+
+
+# Every descriptor the catalogue knows, at its first index, written out here rather than read
+# from the code that builds them. A probe that quietly covers fewer of these is a probe that
+# misses the wallet it was meant to find, and nothing else would say so
+PROBED_PAIRS = {
+    ('m/0/i', 'LEGACY'), ('m/0/i', 'COMPAT'), ('m/0/i', 'SEGWIT'), ('m/0/i', 'TAPROOT'),
+    ('m/1/i', 'LEGACY'), ('m/1/i', 'COMPAT'), ('m/1/i', 'SEGWIT'), ('m/1/i', 'TAPROOT'),
+    ("m/0'/0'/i'", 'LEGACY'), ("m/0'/0'/i'", 'COMPAT'), ("m/0'/0'/i'", 'SEGWIT'),
+    ("m/0'/0/i", 'LEGACY'), ("m/0'/0/i", 'COMPAT'), ("m/0'/0/i", 'SEGWIT'),
+    ("m/0'/1/i", 'LEGACY'), ("m/0'/1/i", 'COMPAT'), ("m/0'/1/i", 'SEGWIT'),
+    ("m/44'/0'/a'/0/i", 'LEGACY'), ("m/44'/0'/a'/0/i", 'COMPAT'), ("m/44'/0'/a'/0/i", 'SEGWIT'),
+    ("m/44'/0'/a'/1/i", 'LEGACY'), ("m/44'/0'/a'/1/i", 'COMPAT'), ("m/44'/0'/a'/1/i", 'SEGWIT'),
+    ("m/44'/0'/1'/0/i", 'LEGACY'), ("m/44'/0'/1'/0/i", 'COMPAT'), ("m/44'/0'/1'/0/i", 'SEGWIT'),
+    ("m/44'/0'/1'/1/i", 'LEGACY'), ("m/44'/0'/1'/1/i", 'COMPAT'), ("m/44'/0'/1'/1/i", 'SEGWIT'),
+    ("m/49'/0'/a'/0/i", 'COMPAT'), ("m/49'/0'/a'/1/i", 'COMPAT'),
+    ("m/84'/0'/a'/0/i", 'SEGWIT'), ("m/84'/0'/a'/1/i", 'SEGWIT'),
+    ("m/86'/0'/a'/0/i", 'TAPROOT'), ("m/86'/0'/a'/1/i", 'TAPROOT'),
+    ("m/44'/0'/2147483647'/0/i", 'LEGACY'), ("m/44'/0'/2147483647'/1/i", 'LEGACY'),
+    ("m/49'/0'/2147483647'/0/i", 'COMPAT'), ("m/49'/0'/2147483647'/1/i", 'COMPAT'),
+    ("m/84'/0'/2147483647'/0/i", 'SEGWIT'), ("m/84'/0'/2147483647'/1/i", 'SEGWIT'),
+    ("m/84'/0'/2147483646'/0/i", 'SEGWIT'), ("m/84'/0'/2147483646'/1/i", 'SEGWIT'),
+    ("m/84'/0'/2147483645'/0/i", 'SEGWIT'), ("m/84'/0'/2147483645'/1/i", 'SEGWIT'),
+    ("m/84'/0'/2147483644'/0/i", 'SEGWIT'), ("m/84'/0'/2147483644'/1/i", 'SEGWIT'),
+}
+
+
+class TestProbeScripts(unittest.TestCase):
+    """
+    The scripts that say whether a wallet was ever used at all.
+    """
+
+    def test_the_probe_covers_the_whole_catalogue_at_its_first_index(self) -> None:
+        probed = {(script.descriptor.path.path, script.type().name)
+                  for script in scanner.probe_scripts(BIP32.from_seed(BIP32_TEST_SEED))}
+
+        self.assertEqual(probed, PROBED_PAIRS)
+
+    def test_it_asks_for_one_script_of_each_and_no_more(self) -> None:
+        # Forty seven fit in one batch of a hundred; a probe that walked the gap would not
+        scripts = scanner.probe_scripts(BIP32.from_seed(BIP32_TEST_SEED))
+
+        self.assertEqual(len(scripts), len(PROBED_PAIRS))
+        self.assertLessEqual(len(scripts), scanner.MAX_BATCH_SIZE)
+
+    def test_every_probed_script_is_the_first_of_its_descriptor(self) -> None:
+        for script in scanner.probe_scripts(BIP32.from_seed(BIP32_TEST_SEED)):
+            with self.subTest(path=script.descriptor.path.path, type=script.type().name):
+                self.assertEqual(script.index, 0)
+                self.assertEqual(script.account, 0)
+
+    def test_a_public_key_is_probed_only_where_it_can_derive(self) -> None:
+        # The hardened paths are left out of the catalogue for a public key, so the probe of
+        # one is shorter rather than a run of derivation failures
+        public = BIP32.from_xpub(BIP32.from_seed(BIP32_TEST_SEED).get_xpub())
+        probed = {(script.descriptor.path.path, script.type().name)
+                  for script in scanner.probe_scripts(public)}
+
+        # Spelled out rather than 'fewer than the whole catalogue', which the empty set also
+        # satisfies: a probe of a public key that asks for nothing at all finds nothing
+        self.assertEqual(probed, {(path, type) for path, type in PROBED_PAIRS if "'" not in path})
+        self.assertEqual(len(probed), 8)
+
+
+class CountingClient(FakeClient):
+    """
+    Server that keeps count of how many times it was asked anything, and for what.
+    """
+
+    def __init__(self, used_hashes: Set[str], answer: object = UNCHANGED) -> None:
+        super().__init__(used_hashes)
+        self.calls = 0
+        self.asked: List[str] = []
+        self.methods: List[str] = []
+        self.windows: List[int] = []
+        self.answer = answer
+
+    async def RPC(self, method: str, *params: Any) -> object:
+        self.calls += 1
+        self.methods.append(method)
+        self.windows.append(1)
+        self.asked.append(params[0])
+
+        if self.answer is not UNCHANGED:
+            return self.answer
+
+        return await super().RPC(method, *params)
+
+    async def batch_rpc(self, requests: List[Tuple[str, ...]]) -> object:
+        self.calls += 1
+        self.methods.extend(method for method, _ in requests)
+        self.windows.append(len(requests))
+        self.asked.extend(script_hash for _, script_hash in requests)
+
+        if self.answer is not UNCHANGED:
+            return [self.answer] * len(requests)
+
+        return await super().batch_rpc(requests)
+
+
+def _children_of(count: int) -> List[Tuple[str, BIP32]]:
+    """
+    Stand-ins for the wallets one seed hides, each a different key under a readable name.
+    """
+    return [(f'child{at}', BIP32.from_seed(bytes([at]) * 16)) for at in range(count)]
+
+
+class TestWhichChildrenWereUsed(unittest.TestCase):
+    """
+    Asking a server which of several wallets it has ever seen.
+    """
+
+    def _ask(self, children: List[Tuple[str, BIP32]], used: Set[str],
+             should_batch: bool = True,
+             answer: object = UNCHANGED) -> Tuple[List[Tuple[str, Any]], CountingClient]:
+        client = CountingClient(used, answer)
+
+        async def ask() -> object:
+            return await scanner.which_children_were_used(client, children, should_batch)
+
+        with redirect_stdout(io.StringIO()):
+            return asyncio.run(ask()), client
+
+    def test_it_asks_for_history_and_not_for_what_is_unspent(self) -> None:
+        # A wallet whose money is gone still has to be named: it is the one whose seed the
+        # person is holding. Asking what is unspent answers nothing about a spent wallet,
+        # and the fake server here cannot tell the two questions apart
+        _, client = self._ask(_children_of(2), set())
+
+        self.assertEqual(set(client.methods), {'blockchain.scripthash.get_history'})
+
+    def test_a_server_that_answers_with_something_else_is_refused(self) -> None:
+        # Anything truthy would otherwise read as a history and name a wallet nobody used
+        with self.assertRaises(ValueError):
+            self._ask(_children_of(1), set(), answer={'not': 'a history'})
+
+    def test_a_wallet_no_server_ever_saw_is_not_reported(self) -> None:
+        found, _ = self._ask(_children_of(3), set())
+
+        self.assertEqual(found, [])
+
+    def test_a_used_wallet_is_reported_with_where_it_was_used(self) -> None:
+        children = _children_of(3)
+        form, root = children[1]
+        script = scanner.probe_scripts(root)[7]
+        found, _ = self._ask(children, {scanner._electrum_script_hash(script.program)})
+
+        self.assertEqual([name for name, _ in found], [form])
+        self.assertEqual([hit.program for hit in found[0][1]], [script.program])
+
+    def test_a_hit_on_a_batch_boundary_belongs_to_the_child_that_owns_it(self) -> None:
+        # Forty seven scripts a child and a hundred a batch means no child lines up with a
+        # batch. A reader that pairs answers with the wrong window hands the history of one
+        # wallet to another, and sends whoever reads it to recover the wrong seed
+        children = _children_of(4)
+        asked = [(form, script) for form, root in children for script in scanner.probe_scripts(root)]
+        each = len(scanner.probe_scripts(children[0][1]))
+
+        # Both kinds of edge: where a batch is cut, and where one child ends and the next
+        # begins. The two never line up, so a reader can be wrong at one and right at the
+        # other, and only the second hands one wallet's history to another
+        edges = [scanner.MAX_BATCH_SIZE - 1, scanner.MAX_BATCH_SIZE, scanner.MAX_BATCH_SIZE + 1]
+        edges += [at + step for at in range(each, len(asked), each) for step in [-1, 0]]
+
+        for at in sorted(set(edges)):
+            with self.subTest(script=at):
+                form, script = asked[at]
+                found, _ = self._ask(children, {scanner._electrum_script_hash(script.program)})
+
+                self.assertEqual([name for name, _ in found], [form])
+                self.assertEqual([hit.program for hit in found[0][1]], [script.program])
+
+    def test_the_children_of_several_indexes_go_out_together(self) -> None:
+        # One round trip a child would spend four where one and a bit are needed
+        children = _children_of(4)
+        scripts = len(children) * len(scanner.probe_scripts(children[0][1]))
+        _, client = self._ask(children, set())
+
+        self.assertEqual(len(client.asked), scripts)
+        self.assertEqual(client.calls, math.ceil(scripts / scanner.MAX_BATCH_SIZE))
+
+        # The count alone is satisfied by any window between half a batch and a whole one,
+        # so the windows themselves are what says a batch is being filled
+        whole, last = divmod(scripts, scanner.MAX_BATCH_SIZE)
+        self.assertEqual(client.windows, [scanner.MAX_BATCH_SIZE] * whole + [last])
+
+    def test_without_batching_it_asks_one_at_a_time(self) -> None:
+        children = _children_of(2)
+        scripts = len(children) * len(scanner.probe_scripts(children[0][1]))
+        _, client = self._ask(children, set(), should_batch=False)
+
+        self.assertEqual(client.calls, scripts)
+
+    def test_a_wallet_is_reported_once_however_many_of_its_scripts_were_used(self) -> None:
+        children = _children_of(2)
+        form, root = children[0]
+        used = {scanner._electrum_script_hash(script.program)
+                for script in scanner.probe_scripts(root)[:5]}
+        found, _ = self._ask(children, used)
+
+        self.assertEqual([name for name, _ in found], [form])
+
+    def test_every_script_with_a_history_comes_back_and_not_just_the_first(self) -> None:
+        # Keeping the first alone would name the wallet by one address and then answer what
+        # is left in it from that address, which for a wallet used at one path and holding
+        # at another says it is empty
+        children = _children_of(1)
+        scripts = scanner.probe_scripts(children[0][1])
+        wanted = [scripts[3], scripts[8], scripts[40]]
+        used = {scanner._electrum_script_hash(script.program) for script in wanted}
+        found, _ = self._ask(children, used)
+
+        self.assertEqual([hit.program for hit in found[0][1]],
+                         [script.program for script in wanted])
+
+    def test_the_order_reported_is_the_order_the_children_came_in(self) -> None:
+        children = _children_of(3)
+        used = {scanner._electrum_script_hash(scanner.probe_scripts(root)[0].program)
+                for _, root in children}
+        found, _ = self._ask(children, used)
+
+        self.assertEqual([name for name, _ in found], [form for form, _ in children])
+
+
+class TestBalancesAt(unittest.TestCase):
+    """
+    What is still sitting at the addresses a probe found, wallet by wallet.
+    """
+
+    class Answering(FakeClient):
+        """
+        Server that answers each scripthash with whatever it was told to.
+        """
+
+        def __init__(self, by_hash: Dict[str, object]) -> None:
+            super().__init__(set())
+            self.by_hash = by_hash
+
+        def _answer(self, method: str, script_hash: str) -> object:
+            return self.by_hash.get(script_hash, [])
+
+    def _ask(self, groups: List[List[object]], by_hash: Dict[str, object]) -> List[int]:
+        async def ask() -> object:
+            return await scanner.balances_at(self.Answering(by_hash), groups)
+
+        return asyncio.run(ask())
+
+    def _scripts(self) -> List[object]:
+        return scanner.probe_scripts(BIP32.from_seed(BIP32_TEST_SEED))[:4]
+
+    def test_nothing_asked_about_is_nothing_answered(self) -> None:
+        self.assertEqual(self._ask([], {}), [])
+
+    def test_each_wallet_gets_its_own_sum_and_not_the_whole(self) -> None:
+        # One number for all of them would put one wallet's money under another's name,
+        # and the one reported as empty is the one somebody stops looking for
+        first, second, third, fourth = self._scripts()
+        answers = {scanner._electrum_script_hash(script.program): [_unspent_worth(amount)]
+                   for script, amount in [(first, 1000), (second, 2000), (fourth, 7000)]}
+
+        self.assertEqual(self._ask([[first, second], [third], [fourth]], answers),
+                         [3000, 0, 7000])
+
+    def test_several_addresses_of_one_wallet_are_added_up(self) -> None:
+        first, second = self._scripts()[:2]
+        answers = {scanner._electrum_script_hash(script.program):
+                   [_unspent_worth(500), _unspent_worth(250)] for script in [first, second]}
+
+        self.assertEqual(self._ask([[first, second]], answers), [1500])
+
+    def test_an_output_the_server_made_up_is_refused_rather_than_counted_as_nothing(self) -> None:
+        # Zero reads as 'nothing is left in it', which is the sentence that ends a search,
+        # so a server that answers something else cannot be allowed to produce one
+        script = self._scripts()[0]
+        asked = scanner._electrum_script_hash(script.program)
+
+        for answer in [['not an output'], [{'no': 'value'}], [{'value': 'lots'}],
+                       [{'value': True}], 'not even a list']:
+            with self.subTest(answer=answer):
+                with self.assertRaises(ValueError):
+                    self._ask([[script]], {asked: answer})
+
+
+def _unspent_worth(amount: int) -> Dict[str, object]:
+    return {'tx_hash': 'ab' * 32, 'tx_pos': 0, 'value': amount}
 
 
 class TestRepeatedOutputs(unittest.TestCase):

@@ -22,8 +22,10 @@ from connectrum.svr_info import ServerInfo
 from mnemonic import Mnemonic
 
 import indy
+import bip85
 import descriptors
 import scanner
+import scripts
 import transactions
 from descriptors import Path
 from tests.test_scanner import _transaction_paying
@@ -202,6 +204,10 @@ def _sweep(quoted_rate: object, balance: int = 1_000_000, answer: Optional[str] 
 
         async def connect(self, *args: object, **kwargs: object) -> None:
             pass
+
+        async def batch_rpc(self, requests: List[Tuple[str, ...]]) -> object:
+            # Nothing was ever seen at any of them, which is what an unused seed looks like
+            return [[] for _ in requests]
 
         async def RPC(self, method: str, *params: object) -> object:
             events.append(method)
@@ -1164,7 +1170,7 @@ class TestPublicKeyScan(unittest.TestCase):
         output, _ = self._run(used='m/0/0', key=account)
 
         self.assertIn('Found used addresses', output)
-        self.assertIn('Total spendable balance found: 100000', output)
+        self.assertIn('Total spendable balance found in the key that was read: 100000', output)
 
     def _key_at(self, path: List[int]) -> BIP32:
         """
@@ -1223,13 +1229,265 @@ class TestPublicKeyScan(unittest.TestCase):
         # The funds are there and reported; what a public key cannot do is spend them
         output, _ = self._run(used='m/0/0')
 
-        self.assertIn('Total spendable balance found: 100000', output)
+        self.assertIn('Total spendable balance found in the key that was read: 100000', output)
         self.assertIn('Re-run with a private key', output)
 
     def test_nothing_is_claimed_when_nothing_is_there(self) -> None:
         output, _ = self._run()
 
         self.assertIn('Didn\'t find any unspent outputs', output)
+
+
+def _usage() -> str:
+    """
+    What the parser itself says it accepts, so a flag the output names can be checked.
+    """
+    output = io.StringIO()
+
+    with mock.patch.object(sys, 'argv', ['indy.py', '--help']), redirect_stdout(output):
+        try:
+            indy.main()
+        except SystemExit:
+            pass
+
+    return output.getvalue()
+
+
+class TestLookingUnderBip85(unittest.TestCase):
+    """
+    The wallets a seed hides, when they are looked for and what is said about them.
+    """
+
+    # A child of this seed that a server has seen, and one it has not
+    USED_INDEX = 1
+    UNSEEN_INDEX = 4
+
+    def _utxo(self) -> scanner.Utxo:
+        return scanner.Utxo('ab' * 32, 0, 50_000, Path("m/84'/0'/0'/0/0"), ScriptType.SEGWIT)
+
+    def _root(self) -> BIP32:
+        return BIP32.from_seed(Mnemonic.to_seed(Mnemonic('english').to_mnemonic(bytes(16))))
+
+    def _seen(self, index: int) -> Set[bytes]:
+        form, root = bip85.children(self._root(), index)[0]
+        return {script.program for script in scanner.probe_scripts(root)}
+
+    def _run(self, key: Optional[BIP32] = None, utxos: Optional[List[scanner.Utxo]] = None,
+             seen: Optional[Set[bytes]] = None, balance: int = 99_000, **options: object) -> str:
+        seen = self._seen(self.USED_INDEX) if seen is None else seen
+        asked = []
+        batching = []
+
+        class FakeClient:
+            def __init__(self, **kwargs: object) -> None:
+                pass
+
+            async def connect(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            async def RPC(self, *args: object) -> object:
+                return -1
+
+            async def batch_rpc(self, requests: List[Tuple[str, ...]]) -> object:
+                return [[] for _ in requests]
+
+            def close(self) -> None:
+                pass
+
+        async def scan(*args: object, **kwargs: object) -> List[scanner.Utxo]:
+            return utxos or []
+
+        async def which(client: object, children: object, should_batch: bool) -> object:
+            asked.append(len(children))
+            batching.append(should_batch)
+            hits = [(form, [script for script in scanner.probe_scripts(root)
+                             if script.program in seen])
+                    for form, root in children]
+
+            return [(form, found) for form, found in hits if found][:1]
+
+        async def balances(client: object, groups: object) -> List[int]:
+            return [balance * len(group) for group in groups]
+
+        output = io.StringIO()
+
+        with mock.patch.object(indy, 'StratumClient', FakeClient), \
+             mock.patch.object(scanner, 'scan_master_key', scan), \
+             mock.patch.object(scanner, 'which_children_were_used', which), \
+             mock.patch.object(scanner, 'balances_at', balances):
+            with redirect_stdout(output):
+                asyncio.run(indy.find_utxos(TEST_SERVER, key or self._root(), 20, 0,
+                                            options.pop('address', None), None, False,
+                                            options.pop('should_batch', True), **options))
+
+        self.children_asked = asked[0] if asked else 0
+        self.batching_asked = batching[0] if batching else None
+
+        return output.getvalue()
+
+    def test_an_empty_scan_looks_under_a_few_children_without_being_asked(self) -> None:
+        # The person who does not know BIP85 exists never passes the flag, so a scan that
+        # found nothing is the one moment worth spending a little to look
+        self._run(seen=set())
+
+        self.assertEqual(self.children_asked,
+                         indy.BIP85_INDICES_WHEN_NOBODY_SAID * len(bip85.children(self._root(), 0)))
+
+    def test_it_looks_as_far_as_it_was_asked_to(self) -> None:
+        self._run(seen=set(), bip85_indices=7)
+
+        self.assertEqual(self.children_asked, 7 * len(bip85.children(self._root(), 0)))
+
+    def test_zero_looks_under_none_and_does_not_talk_as_if_it_had(self) -> None:
+        # Every failed recovery would otherwise pay those requests to a stranger's server
+        # with no way out of it
+        output = self._run(seen=set(), bip85_indices=0)
+
+        self.assertEqual(self.children_asked, 0)
+        self.assertNotIn('Looked under', output)
+        self.assertIn('--bip85-indices', output)
+
+    def test_a_scan_that_found_money_does_not_go_looking_unasked(self) -> None:
+        output = self._run(utxos=[self._utxo()], seen=set())
+
+        self.assertEqual(self.children_asked, 0)
+        self.assertIn('--bip85-indices', output)
+
+    def test_a_scan_that_found_money_still_looks_when_it_was_asked_to(self) -> None:
+        # Dust in the seed and the real wallet in a child is the case where a sweep of the
+        # seed reads as the end of the story
+        output = self._run(utxos=[self._utxo()], bip85_indices=3)
+
+        self.assertGreater(self.children_asked, 0)
+        self.assertIn(f'Index {self.USED_INDEX}', output)
+
+    def test_a_child_is_named_before_the_money_of_the_seed_is(self) -> None:
+        # With `--yes` nobody reads what comes after the transaction
+        output = self._run(utxos=[self._utxo()], bip85_indices=3)
+
+        self.assertLess(output.index(f'Index {self.USED_INDEX}'),
+                        output.index('Total spendable balance found'))
+
+    def test_a_child_that_was_found_replaces_the_sad_face(self) -> None:
+        # The last line is the one that gets believed
+        output = self._run(bip85_indices=3)
+
+        self.assertIn(f'Index {self.USED_INDEX}', output)
+        self.assertNotIn("Didn't find any unspent outputs", output)
+
+    def test_a_child_is_named_by_what_does_not_spend_it(self) -> None:
+        # The path and the address are what someone recognises; the phrase is what empties
+        # the wallet, and it stays off the screen until it is asked for by name
+        output = self._run(bip85_indices=3)
+        form, root = bip85.children(self._root(), self.USED_INDEX)[0]
+        script = scanner.probe_scripts(root)[0]
+
+        self.assertIn(script.full_path().path, output)
+        self.assertIn(scripts.address_of(script.program), output)
+        self.assertIn('At least', output)
+        self.assertIn(' sats at the addresses looked at', output)
+        self.assertNotIn(bip85.mnemonic_child(self._root(), 12, self.USED_INDEX), output)
+        self.assertNotIn(root.get_xpriv(), output)
+
+    def test_what_was_looked_under_is_said_whenever_something_was(self) -> None:
+        # A search that says nothing about its own reach reads as one that looked everywhere
+        output = self._run(seen=set(), bip85_indices=9)
+
+        self.assertIn('Looked under 9', output)
+
+        for said in ['English', 'twelve, eighteen and twenty four', 'first address',
+                     'passphrase', 'index past the ones looked under']:
+            with self.subTest(said=said):
+                self.assertIn(said, output)
+
+    def test_the_phrase_is_handed_over_only_when_it_is_asked_for_by_name(self) -> None:
+        # Offering a way out that does not exist is worse than offering none: the person
+        # runs the flag the output named and argparse turns them away
+        withheld = self._run(bip85_indices=3)
+        handed = self._run(bip85_indices=3, show_bip85_phrase=True)
+        phrase = bip85.mnemonic_child(self._root(), 12, self.USED_INDEX)
+
+        self.assertNotIn(phrase, withheld)
+        self.assertIn('--show-bip85-phrase', withheld)
+        self.assertIn(phrase, handed)
+        self.assertIn('spends those funds', handed)
+        self.assertNotIn('--show-bip85-phrase', handed.split('⚠️')[-1])
+
+    def test_the_flag_that_the_output_names_is_one_the_parser_accepts(self) -> None:
+        offered = re.findall(r'`(--[a-z0-9-]+)`', self._run(bip85_indices=3))
+
+        self.assertIn('--show-bip85-phrase', offered)
+
+        for flag in offered:
+            with self.subTest(flag=flag):
+                self.assertIn(flag, _usage())
+
+    def test_the_balance_is_a_floor_over_every_address_that_had_a_history(self) -> None:
+        # Summing one address of a wallet used at several says a wallet is empty when the
+        # money is at a path this did not report, which is the sentence that ends a search.
+        # The number, not the wording, is what says every one of them was counted
+        hits = len([script for script in scanner.probe_scripts(
+            bip85.children(self._root(), self.USED_INDEX)[0][1])
+            if script.program in self._seen(self.USED_INDEX)])
+        output = self._run(bip85_indices=3, balance=1_000)
+
+        self.assertGreater(hits, 1)
+        self.assertIn(f'At least {hits * 1_000} sats', output)
+
+    def test_the_address_shown_is_said_to_be_one_of_several(self) -> None:
+        # The sum is over every address that had a history and the one printed is the first
+        # of them, which may hold none of those sats. Writing the amount under that address
+        # alone would put the money somewhere it is not
+        output = self._run(bip85_indices=3)
+        hits = len([script for script in scanner.probe_scripts(
+            bip85.children(self._root(), self.USED_INDEX)[0][1])
+            if script.program in self._seen(self.USED_INDEX)])
+
+        self.assertIn(f'and at {hits - 1} more of the addresses looked at', output)
+
+    def test_what_bip85_has_to_say_comes_before_the_money_of_this_key(self) -> None:
+        # With `--yes` the hex and the broadcast follow that number with no pause, so a
+        # coverage note printed after it is one nobody reads
+        output = self._run(utxos=[self._utxo()], seen=set(), bip85_indices=3)
+
+        self.assertLess(output.index('Looked under 3'),
+                        output.index('Total spendable balance found'))
+
+    def test_the_balance_of_this_key_says_whose_it_is(self) -> None:
+        # It is the number the transaction is built from, and it is printed right after a
+        # number that belongs to another wallet entirely
+        output = self._run(utxos=[self._utxo()], bip85_indices=3)
+
+        self.assertIn('Total spendable balance found in the key that was read', output)
+
+    def test_what_was_looked_under_is_said_even_when_the_seed_had_money(self) -> None:
+        # Otherwise the one combination that ends in a signed transaction is the one that
+        # never says how little was looked at
+        output = self._run(utxos=[self._utxo()], seen=set(), bip85_indices=3)
+
+        self.assertIn('Looked under 3', output)
+
+    def test_not_batching_reaches_the_children(self) -> None:
+        # The flag exists for a server that does not speak batches. Scanning the seed and
+        # then blowing up on its children is worse than not looking at all
+        for batching in [True, False]:
+            with self.subTest(batching=batching):
+                self._run(seen=set(), bip85_indices=2, should_batch=batching)
+
+                self.assertEqual(self.batching_asked, batching)
+
+    def test_a_key_that_cannot_reach_bip85_is_told_so_rather_than_searched(self) -> None:
+        # An account key is private and still cannot walk a path counted from the root
+        private = BIP32.from_xpriv(BIP32_TEST_XPRIV)
+        account = BIP32.from_xpriv(private.get_xpriv_from_path(
+            [BIP84_PURPOSE + HARDENED_INDEX, HARDENED_INDEX, HARDENED_INDEX]))
+
+        for key in [BIP32.from_xpub(private.get_xpub()), account]:
+            with self.subTest(depth=key.depth, private=key.privkey is not None):
+                output = self._run(key=key, seen=set())
+
+                self.assertEqual(self.children_asked, 0)
+                self.assertIn('seed phrase or the root xpriv', output)
 
 
 class TestMultisigKeys(unittest.TestCase):
@@ -1255,6 +1513,9 @@ class TestMultisigKeys(unittest.TestCase):
 
             async def RPC(self, *args: object) -> object:
                 return []
+
+            async def batch_rpc(self, requests: List[Tuple[str, ...]]) -> object:
+                return [[] for _ in requests]
 
             def close(self) -> None:
                 pass

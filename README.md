@@ -65,9 +65,10 @@ same way.
 
 ```
 usage: indy.py [-h] [--passphrase <pass> | --ask-passphrase]
-               [--allow-invalid-checksum] [--electrum] [--show-multisig-keys]
-               [--address <address>] [--broadcast] [--fee-rate <rate>]
-               [--allow-high-fee] [--yes] [--address-gap <num>]
+               [--allow-invalid-checksum] [--electrum] [--show-bip85-phrase]
+               [--show-multisig-keys] [--address <address>] [--broadcast]
+               [--fee-rate <rate>] [--allow-high-fee] [--yes]
+               [--address-gap <num>] [--bip85-indices <num>]
                [--account-gap <num>] [--host <host>] [--port <port>]
                [--protocol {t,s}] [--no-batching] [--insecure]
                [key]
@@ -91,6 +92,8 @@ options:
                         match
   --electrum            read the phrase as Electrum's when it reads as BIP39
                         as well
+  --show-bip85-phrase   print what opens each BIP85 wallet found, which is
+                        also what empties it and what stays in your scrollback
   --show-multisig-keys  print the multisig keys a private root holds, under
                         BIP48 or under Electrum's own convention, which reveal
                         the addresses of those branches to whoever reads them
@@ -104,6 +107,11 @@ sweep transaction:
 
 scanning parameters:
   --address-gap <num>   max empty addresses gap to explore (default: 20)
+  --bip85-indices <num>
+                        how many BIP85 child wallets of this seed to look
+                        under. Left off, three are looked under when nothing
+                        else turns up, and none when it does; 0 looks under
+                        none at all
   --account-gap <num>   max empty account levels gap to explore (default: 0)
 
 electrum server:
